@@ -1,21 +1,44 @@
-variable "env" { 
-    type = string 
+variable "vpc_name" {
+  type        = string
+  description = "Friendly name for this VPC"
 }
-variable "vpc_cidr" { 
-    type = string 
+
+variable "env" {
+  default     = "dev"
+  type        = string
+  description = "Deployment environment"
 }
-variable "public_subnet_cidrs" { 
-    type = list(string) 
+
+variable "cidr_block" {
+  type        = string
+  description = "VPC CIDR block"
 }
-variable "private_subnet_cidrs" { 
-    type = list(string) 
+
+variable "map_pub_ip" {
+  type    = bool
+  default = true
 }
-variable "use_existing_vpc" { 
-    type = bool 
+
+variable "public_subnets" {
+  type = map(any) # assumes an object as defined below
+  #default = {
+  #  availability_zone = string
+  #  cidr_block        = string
+  #}
+  description = "Public Subnets"
 }
-variable "existing_vpc_id" { 
-    type = string 
+
+variable "private_subnets" {
+  type = map(any)
+  # assumes an object as defined below
+  #default = {
+  #  availability_zone = string
+  #  cidr_block        = string
+  #}
+  description = "Private Subnets"
 }
-variable "existing_subnet_ids" { 
-    type = list(string) 
+
+variable "tags" {
+  type        = map(any)
+  description = "Map of tags to be passed to the VPC and VPC resources"
 }
