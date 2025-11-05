@@ -1,0 +1,98 @@
+- bash: |
+    set -euo pipefail
+
+    # Start Docker if present
+    if command -v systemctl >/dev/null 2>&1; then
+      sudo systemctl start docker || true
+    fi
+    sudo docker version
+
+    cd "$(Build.SourcesDirectory)"
+
+    # Use --platform if supported; fallback if pull fails
+    PLAT_FLAG=""
+    if sudo docker run --help 2>&1 | grep -q -- '--platform'; then
+      PLAT_FLAG="--platform=linux/amd64"
+    fi
+    if ! sudo docker pull $PLAT_FLAG ghcr.io/boltops-tools/terraspace:latest; then
+      sudo docker pull ghcr.io/boltops-tools/terraspace:latest
+      PLAT_FLAG=""
+    fi
+
+    # Build a combined CA bundle from the agent (handles your tf.puget.com TLS)
+    CA_TMP="/tmp/combined-ca.pem"; : >"$CA_TMP"
+    for f in \
+      /etc/ssl/certs/ca-certificates.crt \
+      /etc/pki/tls/certs/ca-bundle.crt \
+      /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+    do [ -s "$f" ] && cat "$f" >>"$CA_TMP"; done
+    if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
+      cat /usr/local/share/ca-certificates/*.crt >>"$CA_TMP"
+    fi
+
+    # Old 18.06 daemon knobs
+    LIMITS="--pids-limit 4096 --ulimit nproc=4096:8192 --ulimit nofile=65536:65536"
+    SECURITY="--security-opt seccomp=unconfined --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE"
+
+    # Pass parameters as env (avoid quoting issues)
+    TS_ACTION="${{ parameters.action }}"
+    TS_STACK="${{ parameters.tsStack }}"
+    TS_ENV="${{ parameters.tsEnv }}"
+
+    sudo docker run --rm $PLAT_FLAG $LIMITS $SECURITY \
+      --entrypoint /bin/sh \
+      -v "$(pwd)":/workspace \
+      -v "$CA_TMP":/etc/ssl/certs/ca-corp-bundle.pem:ro \
+      -w /workspace/terraspace \
+      -e TF_CLOUD_HOSTNAME=tf.puget.com \
+      -e TF_TOKEN_tf_puget_com \
+      -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN -e AWS_DEFAULT_REGION \
+      -e SSL_CERT_FILE=/etc/ssl/certs/ca-corp-bundle.pem \
+      -e CURL_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem \
+      -e REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem \
+      -e GIT_SSL_CAINFO=/etc/ssl/certs/ca-corp-bundle.pem \
+      -e TS_VERSION_CHECK=0 \
+      -e TS_ACTION="$TS_ACTION" -e TS_STACK="$TS_STACK" -e TS_ENV="$TS_ENV" \
+      ghcr.io/boltops-tools/terraspace:latest \
+      -c '
+        set -eu
+
+        export PATH=/opt/terraspace/embedded/bin:$PATH
+        export GEM_HOME=/opt/terraspace/embedded/lib/ruby/gems/3.0.0
+        export GEM_PATH=$GEM_HOME
+        export BUNDLE_JOBS=1 BUNDLE_RETRY=2
+
+        # Ensure native deps are prebuilt (no compile) + AWS plugin installed
+        gem list -i nokogiri >/dev/null 2>&1 || gem install -N nokogiri -v 1.15.4 --platform x86_64-linux
+        gem list -i terraspace_plugin_aws >/dev/null 2>&1 || gem install -N terraspace_plugin_aws
+
+        echo "--- Versions ---"
+        terraform -version
+        /opt/terraspace/embedded/bin/terraspace -v
+
+        STACK="${TS_STACK:-vpc}"
+        ENVN="${TS_ENV:-dev}"
+        ACTION="${TS_ACTION:-plan}"
+
+        # Build stack and pre-init Terraform Cloud in the cache dir
+        /opt/terraspace/embedded/bin/terraspace build "$STACK" --env "$ENVN"
+        CACHE=".terraspace-cache/$ENVN/stacks/$STACK"
+        if [ -d "$CACHE" ]; then
+          echo "--- terraform init (TFC reconfigure) ---"
+          ( cd "$CACHE" && terraform init -reconfigure -upgrade -input=false -no-color )
+        fi
+
+        case "$ACTION" in
+          plan)    exec /opt/terraspace/embedded/bin/terraspace plan   "$STACK" --env "$ENVN" --no-color ;;
+          apply)   exec /opt/terraspace/embedded/bin/terraspace up     "$STACK" --env "$ENVN" -y --no-color ;;
+          destroy) exec /opt/terraspace/embedded/bin/terraspace down   "$STACK" --env "$ENVN" -y --no-color ;;
+          *) echo "Invalid action: $ACTION"; exit 1 ;;
+        esac
+      '
+  displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }}) – CA + pre-init + safe quoting
+  env:
+    TF_TOKEN_tf_puget_com: $(TERRAFORM_CLOUD_TOKEN)
+    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+    AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
+    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
