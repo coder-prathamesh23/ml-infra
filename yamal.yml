@@ -10,7 +10,6 @@
       sudo docker pull ghcr.io/boltops-tools/terraspace:latest; PLAT_FLAG=""
     fi
 
-    # --- Build a CA bundle from host ---
     CA_TMP="/tmp/combined-ca.pem"; : >"$CA_TMP"
     for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem; do
       [ -s "$f" ] && cat "$f" >>"$CA_TMP"
@@ -18,17 +17,7 @@
     if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
       cat /usr/local/share/ca-certificates/*.crt >>"$CA_TMP"
     fi
-    MOUNT_CA=""; TLS_ENVS=""
-    if [ -s "$CA_TMP" ]; then
-      MOUNT_CA="-v $CA_TMP:/etc/ssl/certs/ca-corp-bundle.pem:ro"
-      TLS_ENVS="-e SSL_CERT_FILE=/etc/ssl/certs/ca-corp-bundle.pem \
-                -e CURL_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem \
-                -e REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem \
-                -e GIT_SSL_CAINFO=/etc/ssl/certs/ca-corp-bundle.pem \
-                -e AWS_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem"
-    fi
 
-    # --- old 18.x daemon knobs ---
     LIMITS="--pids-limit 4096 --ulimit nproc=4096:8192 --ulimit nofile=65536:65536"
     SECURITY="--security-opt seccomp=unconfined --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE"
 
@@ -39,12 +28,15 @@
     sudo docker run --rm $PLAT_FLAG $LIMITS $SECURITY \
       --entrypoint /bin/sh \
       -v "$(pwd)":/workspace \
-      $MOUNT_CA \
+      -v "$CA_TMP":/etc/ssl/certs/ca-corp-bundle.pem:ro \
       -w /workspace/terraspace \
       -e TF_CLOUD_HOSTNAME=tf.puget.com \
       -e TF_TOKEN_tf_puget_com \
       -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN -e AWS_DEFAULT_REGION \
-      $TLS_ENVS \
+      -e SSL_CERT_FILE=/etc/ssl/certs/ca-corp-bundle.pem \
+      -e CURL_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem \
+      -e REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem \
+      -e GIT_SSL_CAINFO=/etc/ssl/certs/ca-corp-bundle.pem \
       -e TS_VERSION_CHECK=0 \
       -e TS_ACTION="$TS_ACTION" -e TS_STACK="$TS_STACK" -e TS_ENV_VAL="$TS_ENV_VAL" \
       ghcr.io/boltops-tools/terraspace:latest \
@@ -54,14 +46,20 @@
         export GEM_HOME=/opt/terraspace/embedded/lib/ruby/gems/3.0.0
         export GEM_PATH=$GEM_HOME
         export BUNDLE_JOBS=1 BUNDLE_RETRY=2
-        # IMPORTANT: do NOT force ruby platform; we want prebuilt linux wheels
         /opt/terraspace/embedded/bin/bundle config set --global path "$GEM_HOME" || true
         /opt/terraspace/embedded/bin/bundle config set --global force_ruby_platform false || true
         /opt/terraspace/embedded/bin/bundle config set --global without "development test" || true
 
-        # Ensure nokogiri prebuilt linux wheel is present for resolver
+        # Ensure nokogiri binary wheel is available (avoid native build)
         gem list -i nokogiri >/dev/null 2>&1 || gem install -N nokogiri -v 1.15.4 --platform x86_64-linux
         gem list -i terraspace_plugin_aws >/dev/null 2>&1 || gem install -N terraspace_plugin_aws
+
+        # --- NEW: install gems for your project Gemfile (which declares terraspace ~> 2) ---
+        if [ -f Gemfile ]; then
+          /opt/terraspace/embedded/bin/bundle lock --add-platform x86_64-linux || true
+          /opt/terraspace/embedded/bin/bundle install --jobs 1 --retry 2 --no-deployment
+        fi
+        # --- END NEW ---
 
         echo "--- Versions ---"
         terraform -version
@@ -71,7 +69,6 @@
         ENVN="${TS_ENV_VAL:-dev}"
         ACTION="${TS_ACTION:-plan}"
 
-        # Build with TS_ENV (no --env here)
         export TS_ENV="$ENVN"
         /opt/terraspace/embedded/bin/terraspace build "$STACK"
 
@@ -88,11 +85,10 @@
           *) echo "Invalid action: $ACTION"; exit 1 ;;
         esac
       '
-  displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }}) – CA + pre-init (nokogiri fix)
+  displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }}) – CA + pre-init (bundle install)
   env:
     TF_TOKEN_tf_puget_com: $(TERRAFORM_CLOUD_TOKEN)
     AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
     AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
     AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
     AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
-
