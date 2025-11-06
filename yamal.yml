@@ -76,7 +76,7 @@ stages:
         TS_ENV_VAL="${{ parameters.tsEnv }}"
 
         sudo docker run --rm $PLAT_FLAG $LIMITS $SECURITY \
-          --entrypoint /bin/bash \   # <<<--- switched from /bin/sh to /bin/bash
+          --entrypoint /bin/sh \
           -v "$(pwd)":/workspace \
           -v "$CA_TMP":/etc/ssl/certs/ca-corp-bundle.pem:ro \
           -v "$TFRC_HOST":/root/.terraform.d/credentials.tfrc.json:ro \
@@ -132,7 +132,7 @@ stages:
             ENVN="${TS_ENV_VAL:-dev}"
             ACTION="${TS_ACTION:-plan}"
 
-            # 1) Build once with Terraspace
+            # 1) Build once with Terraspace (produces .terraspace-cache/<region>/<env>/stacks/<stack>)
             export TS_ENV="$ENVN"
             /opt/terraspace/embedded/bin/terraspace build "$STACK"
 
@@ -145,7 +145,7 @@ stages:
             echo "Using STACK_DIR=$STACK_DIR"
             echo "Using MOD_SRC=$MOD_SRC"
 
-            # 3) Vendor modules into stack and rewrite sources to ./modules/...
+            # 3) Vendor modules into stack and rewrite all module sources to ./modules/...
             if [ -d "$MOD_SRC" ]; then
               rm -rf "$STACK_DIR/modules"; mkdir -p "$STACK_DIR/modules"
               cp -a "$MOD_SRC/." "$STACK_DIR/modules/"
@@ -153,58 +153,64 @@ stages:
                 "s|source[[:space:]]*=[[:space:]]*\"(\\.\\./)+modules/|source = \"./modules/|g"
             fi
 
-            # 4) Bring only stack/env tfvars into stack root (auto-loaded by Terraform/TFC)
-
-            # Promote any build-generated tfvars under stack/tfvars/
-            if [ -d "$STACK_DIR/tfvars" ]; then
-              while IFS= read -r -d "" f; do
+            # 4) Ensure variables are visible to TFC (auto-loaded from stack root)
+            promote_tfvars_dir () {
+              srcdir="$1"
+              [ -d "$srcdir" ] || return 0
+              # copy ANY tfvars (auto or not) and rename to *.auto.tfvars*
+              find "$srcdir" -maxdepth 1 -type f \( -name "*.tfvars" -o -name "*.tfvars.json" -o -name "*.auto.tfvars" -o -name "*.auto.tfvars.json" \) | while read -r f; do
                 base=$(basename "$f")
                 case "$base" in
-                  terraform.tfvars|*.auto.tfvars|*.auto.tfvars.json)
-                    dest="$STACK_DIR/$base"
-                    ;;
-                  *.tfvars.json)
-                    dest="$STACK_DIR/40_${base%.tfvars.json}.auto.tfvars.json"
-                    ;;
-                  *.tfvars)
-                    dest="$STACK_DIR/40_${base%.tfvars}.auto.tfvars"
-                    ;;
-                  *) continue ;;
+                  *.auto.tfvars|*.auto.tfvars.json) dest="$STACK_DIR/$base" ;;
+                  *.tfvars.json) dest="$STACK_DIR/40_${base%.tfvars.json}.auto.tfvars.json" ;;
+                  *.tfvars)      dest="$STACK_DIR/40_${base%.tfvars}.auto.tfvars" ;;
+                  *)             dest="$STACK_DIR/40_${base}.auto.tfvars" ;;
                 esac
-                cp -a "$f" "$dest"
-                echo "  + from build: $(basename "$dest")"
-              done < <(find "$STACK_DIR/tfvars" -maxdepth 1 -type f \
-                        \( -name "*.tfvars" -o -name "*.tfvars.json" -o -name "*.auto.tfvars" -o -name "*.auto.tfvars.json" -o -name "terraform.tfvars" \) -print0)
+                cp -a "$f" "$dest" && echo "  + TFVARS(promoted): $(basename "$dest")"
+              done
+            }
+
+            # Promote tfvars created by Terraspace build
+            promote_tfvars_dir "$STACK_DIR/tfvars"
+            promote_tfvars_dir "$ENV_ROOT/tfvars"
+
+            # Bring in repo tfvars that look relevant (env/stack/generic)
+            copy_tfvar () {
+              src="$1"
+              base=$(basename "$src")
+              case "$base" in
+                *.tfvars.json) dest="$STACK_DIR/50_${base%.tfvars.json}.auto.tfvars.json" ;;
+                *.tfvars)      dest="$STACK_DIR/50_${base%.tfvars}.auto.tfvars" ;;
+                *)             dest="$STACK_DIR/50_${base}.auto.tfvars" ;;
+              esac
+              cp -a "$src" "$dest" && echo "  + TFVARS(repo): $(basename "$dest")"
+            }
+            FOUND=0
+            for f in $(find /workspace -type f \
+                         \( -name "*${ENVN}*.tfvars" -o -name "*${ENVN}*.tfvars.json" \
+                            -o -name "*${STACK}*.tfvars" -o -name "*${STACK}*.tfvars.json" \
+                            -o -name "terraform.tfvars" \) \
+                         ! -path "*/.terraspace-cache/*" | sort); do
+              copy_tfvar "$f"; FOUND=1
+            done
+            if [ "$FOUND" -eq 0 ]; then
+              for f in $(find /workspace -type f \( -name "*.tfvars" -o -name "*.tfvars.json" \) \
+                         ! -path "*/.terraspace-cache/*" | sort); do
+                copy_tfvar "$f"
+              done
             fi
 
-            # Copy repo tfvars that belong to THIS stack
-            for d in \
-              "/workspace/app/stacks/$STACK/tfvars" \
-              "/workspace/stacks/$STACK/tfvars" \
-              "/workspace/terraspace/app/stacks/$STACK/tfvars" \
-              "/workspace/terraspace/stacks/$STACK/tfvars"
-            do
-              [ -d "$d" ] || continue
-              while IFS= read -r -d "" f; do
-                base=$(basename "$f")
-                case "$base" in
-                  "${ENVN}.tfvars"|"${ENVN}.tfvars.json"|terraform.tfvars|base.tfvars|common.tfvars|*.auto.tfvars|*.auto.tfvars.json) ;;
-                  *) continue ;;
-                esac
-                case "$base" in
-                  terraform.tfvars|*.auto.tfvars|*.auto.tfvars.json)
-                    dest="$STACK_DIR/$base" ;;
-                  *.tfvars.json)
-                    dest="$STACK_DIR/50_${base%.tfvars.json}.auto.tfvars.json" ;;
-                  *.tfvars)
-                    dest="$STACK_DIR/50_${base%.tfvars}.auto.tfvars" ;;
-                esac
-                cp -a "$f" "$dest"
-                echo "  + from repo:  $(basename "$dest")"
-              done < <(find "$d" -maxdepth 1 -type f -print0)
+            # Convert any TF_VAR_* envs into a tfvars file so TFC sees them
+            TF_ENV_FILE="$STACK_DIR/90_tf_env.auto.tfvars"
+            : > "$TF_ENV_FILE"
+            env | grep "^TF_VAR_" | while IFS="=" read -r name value; do
+              key="${name#TF_VAR_}"
+              esc=$(printf "%s" "$value" | sed "s/\"/\\\\\"/g")
+              printf "%s = \"%s\"\n" "$key" "$esc" >> "$TF_ENV_FILE"
             done
+            [ -s "$TF_ENV_FILE" ] || rm -f "$TF_ENV_FILE"
 
-            echo "== tfvars present in stack root =="
+            echo "TFVARS present in stack root:"
             ls -1 "$STACK_DIR"/*.tfvars* 2>/dev/null || echo "  (none)"
 
             # 5) Run Terraform directly in built stack (CLI-driven TFC)
@@ -217,10 +223,13 @@ stages:
               *) echo "Invalid action: $ACTION"; exit 1 ;;
             esac
           '
-      displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }}) - module vendoring + stack/env tfvars only
+      displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }}) - vendoring + tfvars autoload for TFC
       env:
         TF_TOKEN_tf_puget_com: $(TERRAFORM_CLOUD_TOKEN)
         TERRAFORM_CLOUD_TOKEN: $(TERRAFORM_CLOUD_TOKEN)
+        # Optional: set TF_VAR_* here if you want to feed variables from the pipeline
+        # Example:
+        # TF_VAR_bucket_name: my-dev-bucket-123
         AWS_ACCESS_KEY_ID:     $(AWS_ACCESS_KEY_ID)
         AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
         AWS_SESSION_TOKEN:     $(AWS_SESSION_TOKEN)
