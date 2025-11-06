@@ -73,7 +73,7 @@ stages:
           cat /usr/local/share/ca-certificates/*.crt >>"$CA_TMP"
         fi
 
-        # Materialize Terraform credentials file on the HOST (no heredoc)
+        # Materialize Terraform credentials file on the HOST
         TF_HOST="${TF_CLOUD_HOSTNAME:-tf.puget.com}"
         TF_TOKEN_VALUE="${TF_TOKEN_tf_puget_com:-${TERRAFORM_CLOUD_TOKEN:-}}"
         if [ -z "${TF_TOKEN_VALUE}" ]; then
@@ -155,6 +155,26 @@ stages:
             # Build (no --env here; we use TS_ENV)
             export TS_ENV=\"\$ENVN\"
             /opt/terraspace/embedded/bin/terraspace build \"\$STACK\"
+
+            # ---------- VENDOR MODULES INTO STACK (for Terraform Cloud) ----------
+            # Terraspace generates module paths like ../../modules/... from stacks/<stack>.
+            # TFC uploads only the working dir (stacks/<stack>) and forbids following parent symlinks.
+            # Copy modules under the stack and rewrite sources to ./modules/...
+            CACHE_ROOT=\".terraspace-cache/\$ENVN\"
+            STACK_DIR=\"\$CACHE_ROOT/stacks/\$STACK\"
+            MOD_SRC=\"\$CACHE_ROOT/modules\"
+            if [ -d \"\$MOD_SRC\" ]; then
+              rm -rf \"\$STACK_DIR/modules\"
+              mkdir -p \"\$STACK_DIR/modules\"
+              # Use cp -a (rsync may not exist in the image)
+              cp -a \"\$MOD_SRC/.\" \"\$STACK_DIR/modules/\"
+              # Rewrite '../../modules' -> './modules' in generated tf files
+              if command -v sed >/dev/null 2>&1; then
+                find \"\$STACK_DIR\" -maxdepth 1 -type f -name '*.tf' -print0 | xargs -0 sed -i 's|\\./\\./\\./\\./modules|./modules|g' || true
+                find \"\$STACK_DIR\" -maxdepth 1 -type f -name '*.tf' -print0 | xargs -0 sed -i 's|\\\.\\\./\\\.\\\./modules|./modules|g' || true
+              fi
+            fi
+            # --------------------------------------------------------------------
 
             CACHE=\".terraspace-cache/\$ENVN/stacks/\$STACK\"
             if [ -d \"\$CACHE\" ]; then
