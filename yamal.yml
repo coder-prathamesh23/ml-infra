@@ -29,18 +29,26 @@
       PLAT_FLAG=""
     fi
 
-    # --- Corporate CA bundle (combine host CAs) ---
+    # ---- Build a MAXIMAL corporate CA bundle from the host ----
     CA_TMP="/tmp/combined-ca.pem"; : >"$CA_TMP"
-    for f in \
-      /etc/ssl/certs/ca-certificates.crt \
-      /etc/pki/tls/certs/ca-bundle.crt \
-      /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+    add_if() { [ -s "$1" ] && cat "$1" >>"$CA_TMP"; }
+
+    add_if /etc/ssl/certs/ca-certificates.crt
+    add_if /etc/pki/tls/certs/ca-bundle.crt
+    add_if /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+    add_if /etc/ssl/cert.pem
+
+    # Any loose CRT/PEM anchors
+    for d in \
+      /usr/local/share/ca-certificates \
+      /etc/pki/ca-trust/source/anchors \
+      /etc/ssl/certs
     do
-      [ -s "$f" ] && cat "$f" >>"$CA_TMP"
+      if [ -d "$d" ]; then
+        find "$d" -maxdepth 1 \( -name '*.crt' -o -name '*.pem' \) -type f -size +1c -print0 \
+          | xargs -0 -I{} sh -c 'cat "{}" >>"'"$CA_TMP"'"'
+      fi
     done
-    if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
-      cat /usr/local/share/ca-certificates/*.crt >>"$CA_TMP"
-    fi
 
     # Old 18.06 daemons: limits + relaxed seccomp
     LIMITS="--pids-limit 4096 --ulimit nproc=4096:8192 --ulimit nofile=65536:65536"
@@ -48,6 +56,12 @@
 
     TS_STACK="${{ parameters.tsStack }}"
     TS_ENV_VAL="${{ parameters.tsEnv }}"
+
+    # Pass proxies through if defined on the agent (handles corp MITM)
+    PROXY_ENVS=()
+    for v in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy NO_PROXY no_proxy; do
+      if env | grep -q "^$v="; then PROXY_ENVS+=( -e "$v" ); fi
+    done
 
     sudo docker run --rm $PLAT_FLAG $LIMITS $SECURITY \
       --entrypoint /bin/sh \
@@ -70,21 +84,17 @@
       -e TS_ENV_VAL="$TS_ENV_VAL" \
       -e TS_VERSION_CHECK=0 \
       -e TFENV_AUTO_INSTALL=false \
+      "${PROXY_ENVS[@]}" \
       ghcr.io/boltops-tools/terraspace:latest \
       -c '
         set -eu
 
-        # Trust the corporate CA inside the container for ALL toolchains (Ruby/OpenSSL/curl/git/Terraform)
-        if command -v update-ca-certificates >/dev/null 2>&1; then
-          # Debian/Ubuntu
-          mkdir -p /usr/local/share/ca-certificates
-          cp /etc/ssl/certs/ca-corp-bundle.pem /usr/local/share/ca-certificates/corp-bundle.crt
-          update-ca-certificates || true
-        elif [ -f /etc/ssl/certs/ca-certificates.crt ]; then
-          # Fallback: append to default bundle
-          cat /etc/ssl/certs/ca-corp-bundle.pem >> /etc/ssl/certs/ca-certificates.crt || true
-        fi
-        # Git also reads its own config occasionally
+        # 1) FORCE the container-wide default OpenSSL bundle to the corporate bundle
+        #    (This avoids tool-by-tool env handling and helps Ruby/OpenSSL specifically.)
+        cp /etc/ssl/certs/ca-corp-bundle.pem /etc/ssl/certs/ca-certificates.crt || true
+        if command -v c_rehash >/dev/null 2>&1; then c_rehash /etc/ssl/certs || true; fi
+
+        # Also keep git explicit
         git config --global http.sslCAInfo /etc/ssl/certs/ca-corp-bundle.pem || true
 
         # Use Terraspace’s embedded Ruby
@@ -95,7 +105,7 @@
         export BUNDLE_RETRY=2
         unset BUNDLE_FORCE_RUBY_PLATFORM
 
-        # Ensure nokogiri is present but avoid native build by using linux platform binary
+        # Ensure nokogiri using linux binary, avoid native build on old Docker
         if ! gem list -i nokogiri >/dev/null 2>&1; then
           gem install -N nokogiri -v 1.15.4 --platform x86_64-linux
         fi
