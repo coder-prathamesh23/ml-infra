@@ -22,7 +22,7 @@ parameters:
   default: us-east-1
 
 variables:
-- group: MLOpsDevToken   # TERRAFORM_CLOUD_TOKEN + AWS_* secrets
+- group: MLOpsDevToken   # TFE token + AWS secrets
 
 stages:
 - stage: Terraspace
@@ -31,7 +31,6 @@ stages:
   - job: Run
     pool:
       name: dataengineering_tf
-
     steps:
     - checkout: self
       fetchDepth: 0
@@ -39,45 +38,35 @@ stages:
     - bash: |
         set -euo pipefail
 
-        if command -v systemctl >/dev/null 2>&1; then
-          sudo systemctl start docker || true
-        fi
+        # Start Docker if needed
+        if command -v systemctl >/dev/null 2>&1; then sudo systemctl start docker || true; fi
         sudo docker version
 
         cd "$(Build.SourcesDirectory)"
 
         PLAT_FLAG=""
-        if sudo docker run --help 2>&1 | grep -q -- '--platform'; then
-          PLAT_FLAG="--platform=linux/amd64"
-        fi
-
+        if sudo docker run --help 2>&1 | grep -q -- '--platform'; then PLAT_FLAG="--platform=linux/amd64"; fi
         if ! sudo docker pull $PLAT_FLAG ghcr.io/boltops-tools/terraspace:latest; then
-          sudo docker pull ghcr.io/boltops-tools/terraspace:latest
-          PLAT_FLAG=""
+          sudo docker pull ghcr.io/boltops-tools/terraspace:latest; PLAT_FLAG=""
         fi
 
-        # Combined CA (system + corp)
-        CA_TMP="/tmp/combined-ca.pem"
-        : >"$CA_TMP"
-        for f in \
-          /etc/ssl/certs/ca-certificates.crt \
-          /etc/pki/tls/certs/ca-bundle.crt \
-          /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
-        do [ -s "$f" ] && cat "$f" >>"$CA_TMP"; done
+        # Build combined CA (system + corp)
+        CA_TMP="/tmp/combined-ca.pem"; : >"$CA_TMP"
+        for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem; do
+          [ -s "$f" ] && cat "$f" >>"$CA_TMP"
+        done
         if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
           cat /usr/local/share/ca-certificates/*.crt >>"$CA_TMP"
         fi
 
-        # Terraform Cloud credentials (host file -> mounted RO)
+        # Write TFE credentials file on host and mount RO
         TF_HOST="${TF_CLOUD_HOSTNAME:-tf.puget.com}"
         TF_TOKEN_VALUE="${TF_TOKEN_tf_puget_com:-${TERRAFORM_CLOUD_TOKEN:-}}"
-        if [ -z "$TF_TOKEN_VALUE" ]; then
-          echo "ERROR: Terraform token missing. Provide TF_TOKEN_tf_puget_com or TERRAFORM_CLOUD_TOKEN." >&2
-          exit 1
+        if [ -z "${TF_TOKEN_VALUE}" ]; then
+          echo "ERROR: Terraform token missing (TF_TOKEN_tf_puget_com/TERRAFORM_CLOUD_TOKEN)." >&2; exit 1
         fi
         TFRC_HOST="/tmp/credentials.tfrc.json"
-        printf '{\n  "credentials": {\n    "%s": {\n      "token": "%s"\n    }\n  }\n}\n' \
-          "$TF_HOST" "$TF_TOKEN_VALUE" > "$TFRC_HOST"
+        printf '{\n  "credentials": {\n    "%s": {\n      "token": "%s"\n    }\n  }\n}\n' "$TF_HOST" "$TF_TOKEN_VALUE" > "$TFRC_HOST"
 
         LIMITS="--pids-limit 4096 --ulimit nproc=4096:8192 --ulimit nofile=65536:65536"
         SECURITY="--security-opt seccomp=unconfined --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE"
@@ -110,95 +99,84 @@ stages:
           -e TS_STACK="$TS_STACK" \
           -e TS_ENV_VAL="$TS_ENV_VAL" \
           ghcr.io/boltops-tools/terraspace:latest \
-          -c "
+          -c '
             set -eu
 
-            # Trust corp CA inside the container
+            # Trust corp CA inside container
             if [ -s /etc/ssl/certs/ca-corp-bundle.pem ]; then
               mkdir -p /usr/local/share/ca-certificates
               cp /etc/ssl/certs/ca-corp-bundle.pem /usr/local/share/ca-certificates/zz_corp-ca.crt
-              if command -v update-ca-certificates >/dev/null 2>&1; then
-                update-ca-certificates
-              else
-                cat /usr/local/share/ca-certificates/zz_corp-ca.crt >> /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true
+              if command -v update-ca-certificates >/dev/null 2>&1; then update-ca-certificates
+              else cat /usr/local/share/ca-certificates/zz_corp-ca.crt >> /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true
               fi
               export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
               export SSL_CERT_DIR=/etc/ssl/certs
-              export CURL_CA_BUNDLE=\$SSL_CERT_FILE
-              export REQUESTS_CA_BUNDLE=\$SSL_CERT_FILE
-              export GIT_SSL_CAINFO=\$SSL_CERT_FILE
+              export CURL_CA_BUNDLE="$SSL_CERT_FILE"
+              export REQUESTS_CA_BUNDLE="$SSL_CERT_FILE"
+              export GIT_SSL_CAINFO="$SSL_CERT_FILE"
             fi
 
-            export PATH=/opt/terraspace/embedded/bin:\$PATH
+            export PATH=/opt/terraspace/embedded/bin:$PATH
             export GEM_HOME=/opt/terraspace/embedded/lib/ruby/gems/3.0.0
-            export GEM_PATH=\$GEM_HOME
+            export GEM_PATH=$GEM_HOME
             export BUNDLE_JOBS=1 BUNDLE_RETRY=2
 
             gem list -i nokogiri >/dev/null 2>&1 || gem install -N nokogiri -v 1.15.4 --platform x86_64-linux
             gem list -i terraspace_plugin_aws >/dev/null 2>&1 || gem install -N terraspace_plugin_aws
 
-            echo '--- Versions ---'
+            echo "--- Versions ---"
             terraform -version
             /opt/terraspace/embedded/bin/terraspace -v
 
-            STACK=\"\${TS_STACK:-vpc}\"
-            ENVN=\"\${TS_ENV_VAL:-dev}\"
-            ACTION=\"\${TS_ACTION:-plan}\"
+            STACK="${TS_STACK:-vpc}"
+            ENVN="${TS_ENV_VAL:-dev}"
+            ACTION="${TS_ACTION:-plan}"
 
-            # Build (TS_ENV controls env)
-            export TS_ENV=\"\$ENVN\"
-            /opt/terraspace/embedded/bin/terraspace build \"\$STACK\"
+            # Build once (produces .terraspace-cache/<region>/<env>/stacks/<stack>)
+            export TS_ENV="$ENVN"
+            /opt/terraspace/embedded/bin/terraspace build "$STACK"
 
-            # Locate actual cache paths (auto-detect region correctly)
-            STACK_DIR=\$(ls -1d .terraspace-cache/*/\"\$ENVN\"/stacks/\"\$STACK\" 2>/dev/null | head -n1 || true)
-            if [ -z \"\$STACK_DIR\" ]; then
-              echo 'ERROR: could not locate Terraspace stack dir in cache'; exit 1
+            # Detect cache paths (auto-detect region)
+            STACK_DIR=$(ls -1d .terraspace-cache/*/"$ENVN"/stacks/"$STACK" 2>/dev/null | head -n1 || true)
+            [ -n "$STACK_DIR" ] || { echo "ERROR: cannot locate Terraspace stack dir"; exit 1; }
+            ENV_ROOT=$(dirname "$(dirname "$STACK_DIR")")    # .terraspace-cache/<region>/<env>
+            MOD_SRC="$ENV_ROOT/modules"
+
+            echo "Using STACK_DIR=$STACK_DIR"
+            echo "Using MOD_SRC=$MOD_SRC"
+
+            # Vendor modules into the stack and rewrite all module sources to ./modules/...
+            if [ -d "$MOD_SRC" ]; then
+              rm -rf "$STACK_DIR/modules"; mkdir -p "$STACK_DIR/modules"
+              cp -a "$MOD_SRC/." "$STACK_DIR/modules/"
+              # rewrite recursively in all .tf files
+              find "$STACK_DIR" -type f -name "*.tf" -print0 | xargs -0 sed -i -E \
+                "s|source[[:space:]]*=[[:space:]]*\"(\\.\\./)+modules/|source = \"./modules/|g"
             fi
-            # ENV_ROOT = .terraspace-cache/<region>/<env>
-            ENV_ROOT=\$(dirname \"\$(dirname \"\$STACK_DIR\")\")
-            MOD_SRC=\"\$ENV_ROOT/modules\"
 
-            echo \"Using STACK_DIR=\$STACK_DIR\"
-            echo \"Using MOD_SRC=\$MOD_SRC\"
-
-            # Vendor all modules under the stack folder and rewrite sources
-            if [ -d \"\$MOD_SRC\" ]; then
-              rm -rf \"\$STACK_DIR/modules\"
-              mkdir -p \"\$STACK_DIR/modules\"
-              cp -a \"\$MOD_SRC/.\" \"\$STACK_DIR/modules/\"
-
-              # Rewrite ANY relative '../../modules/...' or '../modules/...' to './modules/...'
-              for f in \"\$STACK_DIR\"/*.tf; do
-                [ -f \"\$f\" ] || continue
-                # collapse any sequence of ../ that ends with modules/
-                sed -i -E 's|source[[:space:]]*=[[:space:]]*\"(\\.\\./)+modules/|source = \"./modules/|g' \"\$f\"
-                sed -i -E 's|source[[:space:]]*=[[:space:]]*\"\\./modules/|source = \"./modules/|g' \"\$f\"
+            # Collect non-auto tfvars (terraform auto-loads *.auto.tfvars)
+            VAR_ARGS=""
+            if [ -f "$STACK_DIR/terraform.tfvars" ]; then
+              VAR_ARGS="$VAR_ARGS -var-file=$STACK_DIR/terraform.tfvars"
+            fi
+            if [ -d "$STACK_DIR/tfvars" ]; then
+              for f in $(find "$STACK_DIR/tfvars" -type f -name "*.tfvars"); do
+                case "$f" in *.auto.tfvars) : ;; *) VAR_ARGS="$VAR_ARGS -var-file=$f" ;; esac
               done
             fi
+            echo "Using extra var-files: $VAR_ARGS"
 
-            # Re-init in the modified stack dir (so TFC uploads the fixed tree)
-            if [ -d \"\$STACK_DIR\" ]; then
-              echo '--- terraform init (TFC reconfigure after vendoring) ---'
-              ( cd \"\$STACK_DIR\" && terraform init -reconfigure -upgrade -input=false -no-color )
-            fi
-
-            case \"\$ACTION\" in
-              plan)
-                # Terraspace handles remote ops + streaming; keep using it.
-                exec /opt/terraspace/embedded/bin/terraspace plan \"\$STACK\" --env \"\$ENVN\" --no-color
-                ;;
-              apply)
-                exec /opt/terraspace/embedded/bin/terraspace up \"\$STACK\" --env \"\$ENVN\" -y --no-color
-                ;;
-              destroy)
-                exec /opt/terraspace/embedded/bin/terraspace down \"\$STACK\" --env \"\$ENVN\" -y --no-color
-                ;;
-              *)
-                echo 'Invalid action'; exit 1
-                ;;
+            # Now run Terraform directly in the built stack (CLI-driven run uploads this folder to TFE)
+            cd "$STACK_DIR"
+            terraform init -input=false -no-color   # no -reconfigure with TFC
+            case "$ACTION" in
+              plan)    eval "terraform plan   -input=false -no-color $VAR_ARGS" ;;
+              apply)   eval "terraform apply  -input=false -no-color -auto-approve $VAR_ARGS" ;;
+              destroy) eval "terraform destroy -input=false -no-color -auto-approve $VAR_ARGS" ;;
+              *) echo "Invalid action: $ACTION"; exit 1 ;;
             esac
-          "
-      displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }}) - vendored modules for TFC
+          '
+      displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }}) - TFC-safe vendoring
       env:
         TF_TOKEN_tf_puget_com: $(TERRAFORM_CLOUD_TOKEN)
         TERRAFORM_CLOUD_TOKEN: $(TERRAFORM_CLOUD_TOKEN)
