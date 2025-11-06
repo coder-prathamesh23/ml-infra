@@ -66,8 +66,8 @@
       -e GIT_SSL_CAINFO=/etc/ssl/certs/ca-corp-bundle.pem \
       -e TS_STACK="$TS_STACK" \
       -e TS_ENV_VAL="$TS_ENV_VAL" \
-      -e TS_VERSION_CHECK=0 \            # <-- bypass TS TF version gate
-      -e TFENV_AUTO_INSTALL=false \      # <-- stop tfenv from downloading TF
+      -e TS_VERSION_CHECK=0 \
+      -e TFENV_AUTO_INSTALL=false \
       ghcr.io/boltops-tools/terraspace:latest \
       -c '
         set -eu
