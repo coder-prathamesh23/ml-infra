@@ -22,7 +22,7 @@ parameters:
   default: us-east-1
 
 variables:
-- group: MLOpsDevToken   # contains TERRAFORM_CLOUD_TOKEN + AWS_* secrets
+- group: MLOpsDevToken   # TERRAFORM_CLOUD_TOKEN + AWS_* secrets
 
 stages:
 - stage: Terraspace
@@ -39,7 +39,6 @@ stages:
     - bash: |
         set -euo pipefail
 
-        # Start Docker if systemd is available (self-hosted agents)
         if command -v systemctl >/dev/null 2>&1; then
           sudo systemctl start docker || true
         fi
@@ -47,36 +46,32 @@ stages:
 
         cd "$(Build.SourcesDirectory)"
 
-        # Detect --platform support (for ARM runners pulling amd64)
         PLAT_FLAG=""
         if sudo docker run --help 2>&1 | grep -q -- '--platform'; then
           PLAT_FLAG="--platform=linux/amd64"
         fi
 
-        # Pull Terraspace image (retry without --platform if first pull fails)
         if ! sudo docker pull $PLAT_FLAG ghcr.io/boltops-tools/terraspace:latest; then
           sudo docker pull ghcr.io/boltops-tools/terraspace:latest
           PLAT_FLAG=""
         fi
 
-        # Build a combined CA bundle (handles corp CAs/MITM proxies)
+        # Combined CA (system + corp)
         CA_TMP="/tmp/combined-ca.pem"
         : >"$CA_TMP"
         for f in \
           /etc/ssl/certs/ca-certificates.crt \
           /etc/pki/tls/certs/ca-bundle.crt \
           /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
-        do
-          [ -s "$f" ] && cat "$f" >>"$CA_TMP"
-        done
+        do [ -s "$f" ] && cat "$f" >>"$CA_TMP"; done
         if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
           cat /usr/local/share/ca-certificates/*.crt >>"$CA_TMP"
         fi
 
-        # Materialize Terraform credentials file on the HOST (no heredoc)
+        # Terraform Cloud credentials (host file -> mounted RO)
         TF_HOST="${TF_CLOUD_HOSTNAME:-tf.puget.com}"
         TF_TOKEN_VALUE="${TF_TOKEN_tf_puget_com:-${TERRAFORM_CLOUD_TOKEN:-}}"
-        if [ -z "${TF_TOKEN_VALUE}" ]; then
+        if [ -z "$TF_TOKEN_VALUE" ]; then
           echo "ERROR: Terraform token missing. Provide TF_TOKEN_tf_puget_com or TERRAFORM_CLOUD_TOKEN." >&2
           exit 1
         fi
@@ -91,14 +86,13 @@ stages:
         TS_STACK="${{ parameters.tsStack }}"
         TS_ENV_VAL="${{ parameters.tsEnv }}"
 
-        # NOTE: Change -w to /workspace if your Terraspace root is the repo root.
         sudo docker run --rm $PLAT_FLAG $LIMITS $SECURITY \
           --entrypoint /bin/sh \
           -v "$(pwd)":/workspace \
           -v "$CA_TMP":/etc/ssl/certs/ca-corp-bundle.pem:ro \
           -v "$TFRC_HOST":/root/.terraform.d/credentials.tfrc.json:ro \
           -w /workspace/terraspace \
-          -e TF_CLOUD_HOSTNAME=tf.puget.com \
+          -e TF_CLOUD_HOSTNAME="$TF_HOST" \
           -e TF_TOKEN_tf_puget_com \
           -e TERRAFORM_CLOUD_TOKEN \
           -e AWS_ACCESS_KEY_ID \
@@ -119,7 +113,7 @@ stages:
           -c "
             set -eu
 
-            # --- Trust corporate CA inside the container so Terraform trusts tf.puget.com ---
+            # Trust corp CA inside the container
             if [ -s /etc/ssl/certs/ca-corp-bundle.pem ]; then
               mkdir -p /usr/local/share/ca-certificates
               cp /etc/ssl/certs/ca-corp-bundle.pem /usr/local/share/ca-certificates/zz_corp-ca.crt
@@ -134,7 +128,6 @@ stages:
               export REQUESTS_CA_BUNDLE=\$SSL_CERT_FILE
               export GIT_SSL_CAINFO=\$SSL_CERT_FILE
             fi
-            # --- end CA trust ---
 
             export PATH=/opt/terraspace/embedded/bin:\$PATH
             export GEM_HOME=/opt/terraspace/embedded/lib/ruby/gems/3.0.0
@@ -152,36 +145,46 @@ stages:
             ENVN=\"\${TS_ENV_VAL:-dev}\"
             ACTION=\"\${TS_ACTION:-plan}\"
 
-            # Build (no --env here; we use TS_ENV)
+            # Build (TS_ENV controls env)
             export TS_ENV=\"\$ENVN\"
             /opt/terraspace/embedded/bin/terraspace build \"\$STACK\"
 
-            # ---------- VENDOR MODULES (region-aware) ----------
-            REGION=\"\${AWS_REGION:-\${AWS_DEFAULT_REGION:-us-east-1}}\"   # Terraspace cache path uses region
-            CACHE_ROOT=\".terraspace-cache/\$REGION/\$ENVN\"
-            STACK_DIR=\"\$CACHE_ROOT/stacks/\$STACK\"
-            MOD_SRC=\"\$CACHE_ROOT/modules\"
+            # Locate actual cache paths (auto-detect region correctly)
+            STACK_DIR=\$(ls -1d .terraspace-cache/*/\"\$ENVN\"/stacks/\"\$STACK\" 2>/dev/null | head -n1 || true)
+            if [ -z \"\$STACK_DIR\" ]; then
+              echo 'ERROR: could not locate Terraspace stack dir in cache'; exit 1
+            fi
+            # ENV_ROOT = .terraspace-cache/<region>/<env>
+            ENV_ROOT=\$(dirname \"\$(dirname \"\$STACK_DIR\")\")
+            MOD_SRC=\"\$ENV_ROOT/modules\"
 
-            if [ -d \"\$MOD_SRC\" ] && [ -d \"\$STACK_DIR\" ]; then
+            echo \"Using STACK_DIR=\$STACK_DIR\"
+            echo \"Using MOD_SRC=\$MOD_SRC\"
+
+            # Vendor all modules under the stack folder and rewrite sources
+            if [ -d \"\$MOD_SRC\" ]; then
               rm -rf \"\$STACK_DIR/modules\"
               mkdir -p \"\$STACK_DIR/modules\"
               cp -a \"\$MOD_SRC/.\" \"\$STACK_DIR/modules/\"
-              # Rewrite any '../../modules/...' sources to './modules/...'
-              if command -v sed >/dev/null 2>&1; then
-                find \"\$STACK_DIR\" -maxdepth 1 -type f -name '*.tf' -print0 | \
-                  xargs -0 sed -i -E 's|source[[:space:]]*=[[:space:]]*\"\\.{2}/\\.{2}/modules/|source = \"./modules/|g'
-              fi
-            fi
-            # ---------------------------------------------------
 
-            CACHE=\"\$STACK_DIR\"
-            if [ -d \"\$CACHE\" ]; then
-              echo '--- terraform init (TFC reconfigure) ---'
-              ( cd \"\$CACHE\" && terraform init -reconfigure -upgrade -input=false -no-color )
+              # Rewrite ANY relative '../../modules/...' or '../modules/...' to './modules/...'
+              for f in \"\$STACK_DIR\"/*.tf; do
+                [ -f \"\$f\" ] || continue
+                # collapse any sequence of ../ that ends with modules/
+                sed -i -E 's|source[[:space:]]*=[[:space:]]*\"(\\.\\./)+modules/|source = \"./modules/|g' \"\$f\"
+                sed -i -E 's|source[[:space:]]*=[[:space:]]*\"\\./modules/|source = \"./modules/|g' \"\$f\"
+              done
+            fi
+
+            # Re-init in the modified stack dir (so TFC uploads the fixed tree)
+            if [ -d \"\$STACK_DIR\" ]; then
+              echo '--- terraform init (TFC reconfigure after vendoring) ---'
+              ( cd \"\$STACK_DIR\" && terraform init -reconfigure -upgrade -input=false -no-color )
             fi
 
             case \"\$ACTION\" in
               plan)
+                # Terraspace handles remote ops + streaming; keep using it.
                 exec /opt/terraspace/embedded/bin/terraspace plan \"\$STACK\" --env \"\$ENVN\" --no-color
                 ;;
               apply)
@@ -195,11 +198,11 @@ stages:
                 ;;
             esac
           "
-      displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }}) - CA + noninteractive TFC auth
+      displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }}) - vendored modules for TFC
       env:
-        TF_TOKEN_tf_puget_com: $(TERRAFORM_CLOUD_TOKEN)   # token for tf.puget.com
-        TERRAFORM_CLOUD_TOKEN: $(TERRAFORM_CLOUD_TOKEN)   # same token (fallback)
+        TF_TOKEN_tf_puget_com: $(TERRAFORM_CLOUD_TOKEN)
+        TERRAFORM_CLOUD_TOKEN: $(TERRAFORM_CLOUD_TOKEN)
         AWS_ACCESS_KEY_ID:     $(AWS_ACCESS_KEY_ID)
         AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-        AWS_SESSION_TOKEN:     $(AWS_SESSION_TOKEN)       # optional
+        AWS_SESSION_TOKEN:     $(AWS_SESSION_TOKEN)
         AWS_DEFAULT_REGION:    ${{ parameters.awsRegion }}
