@@ -22,7 +22,7 @@ parameters:
   default: us-east-1
 
 variables:
-- group: MLOpsDevToken   # TFE token + AWS secrets
+- group: MLOpsDevToken   # TFE token + AWS_* secrets
 
 stages:
 - stage: Terraspace
@@ -50,7 +50,7 @@ stages:
           sudo docker pull ghcr.io/boltops-tools/terraspace:latest; PLAT_FLAG=""
         fi
 
-        # Build combined CA (system + corp)
+        # Combined CA (system + corp)
         CA_TMP="/tmp/combined-ca.pem"; : >"$CA_TMP"
         for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem; do
           [ -s "$f" ] && cat "$f" >>"$CA_TMP"
@@ -59,7 +59,7 @@ stages:
           cat /usr/local/share/ca-certificates/*.crt >>"$CA_TMP"
         fi
 
-        # Write TFE credentials file on host and mount RO
+        # Terraform Enterprise credentials file on host (mounted RO)
         TF_HOST="${TF_CLOUD_HOSTNAME:-tf.puget.com}"
         TF_TOKEN_VALUE="${TF_TOKEN_tf_puget_com:-${TERRAFORM_CLOUD_TOKEN:-}}"
         if [ -z "${TF_TOKEN_VALUE}" ]; then
@@ -102,7 +102,7 @@ stages:
           -c '
             set -eu
 
-            # Trust corp CA inside container
+            # Trust corp CA inside the container
             if [ -s /etc/ssl/certs/ca-corp-bundle.pem ]; then
               mkdir -p /usr/local/share/ca-certificates
               cp /etc/ssl/certs/ca-corp-bundle.pem /usr/local/share/ca-certificates/zz_corp-ca.crt
@@ -132,51 +132,77 @@ stages:
             ENVN="${TS_ENV_VAL:-dev}"
             ACTION="${TS_ACTION:-plan}"
 
-            # Build once (produces .terraspace-cache/<region>/<env>/stacks/<stack>)
+            # 1) Build once with Terraspace (produces .terraspace-cache/<region>/<env>/stacks/<stack>)
             export TS_ENV="$ENVN"
             /opt/terraspace/embedded/bin/terraspace build "$STACK"
 
-            # Detect cache paths (auto-detect region)
+            # 2) Locate stack dir (auto-detect region)
             STACK_DIR=$(ls -1d .terraspace-cache/*/"$ENVN"/stacks/"$STACK" 2>/dev/null | head -n1 || true)
             [ -n "$STACK_DIR" ] || { echo "ERROR: cannot locate Terraspace stack dir"; exit 1; }
-            ENV_ROOT=$(dirname "$(dirname "$STACK_DIR")")    # .terraspace-cache/<region>/<env>
+            ENV_ROOT=$(dirname "$(dirname "$STACK_DIR")")
             MOD_SRC="$ENV_ROOT/modules"
 
             echo "Using STACK_DIR=$STACK_DIR"
             echo "Using MOD_SRC=$MOD_SRC"
 
-            # Vendor modules into the stack and rewrite all module sources to ./modules/...
+            # 3) Vendor modules into stack and rewrite all module sources to ./modules/...
             if [ -d "$MOD_SRC" ]; then
               rm -rf "$STACK_DIR/modules"; mkdir -p "$STACK_DIR/modules"
               cp -a "$MOD_SRC/." "$STACK_DIR/modules/"
-              # rewrite recursively in all .tf files
-              find "$STACK_DIR" -type f -name "*.tf" -print0 | xargs -0 sed -i -E \
+              find "$STACK_DIR" -maxdepth 1 -type f -name "*.tf" -print0 | xargs -0 sed -i -E \
                 "s|source[[:space:]]*=[[:space:]]*\"(\\.\\./)+modules/|source = \"./modules/|g"
             fi
 
-            # Collect non-auto tfvars (terraform auto-loads *.auto.tfvars)
-            VAR_ARGS=""
-            if [ -f "$STACK_DIR/terraform.tfvars" ]; then
-              VAR_ARGS="$VAR_ARGS -var-file=$STACK_DIR/terraform.tfvars"
-            fi
+            # 4) Make sure variables are visible to TFC:
+            #    - TFC autoloads only terraform.tfvars and *.auto.tfvars[.json] in the working dir.
+            #    - Promote any auto tfvars from build and also copy relevant repo tfvars here, renaming to *.auto.tfvars*.
+
+            # Promote any auto tfvars generated under stack/tfvars/
             if [ -d "$STACK_DIR/tfvars" ]; then
-              for f in $(find "$STACK_DIR/tfvars" -type f -name "*.tfvars"); do
-                case "$f" in *.auto.tfvars) : ;; *) VAR_ARGS="$VAR_ARGS -var-file=$f" ;; esac
+              find "$STACK_DIR/tfvars" -maxdepth 1 -type f \( -name "*.auto.tfvars" -o -name "*.auto.tfvars.json" \) \
+                -exec cp -a {} "$STACK_DIR/" \;
+            fi
+
+            # Copy repo tfvars likely relevant to this env/stack
+            copy_tfvar () {
+              src="$1"
+              base=$(basename "$src")
+              case "$base" in
+                *.tfvars.json) dest="$STACK_DIR/50_${base%.tfvars.json}.auto.tfvars.json" ;;
+                *.tfvars)      dest="$STACK_DIR/50_${base%.tfvars}.auto.tfvars" ;;
+                *)             dest="$STACK_DIR/50_${base}.auto.tfvars" ;;
+              esac
+              cp -a "$src" "$dest" && echo "  + TFVARS: $(basename "$dest")"
+            }
+
+            FOUND=0
+            # Prefer env/stack-specific and generic terraform.tfvars
+            for f in $(find /workspace -type f \
+                         \( -name "*${ENVN}*.tfvars" -o -name "*${ENVN}*.tfvars.json" \
+                            -o -name "*${STACK}*.tfvars" -o -name "*${STACK}*.tfvars.json" \
+                            -o -name "terraform.tfvars" \) \
+                         ! -path "*/.terraspace-cache/*" | sort); do
+              copy_tfvar "$f"; FOUND=1
+            done
+            # Fallback: if still none, copy any tfvars in repo (excluding cache)
+            if [ "$FOUND" -eq 0 ]; then
+              for f in $(find /workspace -type f \( -name "*.tfvars" -o -name "*.tfvars.json" \) \
+                         ! -path "*/.terraspace-cache/*" | sort); do
+                copy_tfvar "$f"
               done
             fi
-            echo "Using extra var-files: $VAR_ARGS"
 
-            # Now run Terraform directly in the built stack (CLI-driven run uploads this folder to TFE)
+            # 5) Run Terraform directly in built stack (CLI-driven TFC)
             cd "$STACK_DIR"
-            terraform init -input=false -no-color   # no -reconfigure with TFC
+            terraform init -input=false -no-color
             case "$ACTION" in
-              plan)    eval "terraform plan   -input=false -no-color $VAR_ARGS" ;;
-              apply)   eval "terraform apply  -input=false -no-color -auto-approve $VAR_ARGS" ;;
-              destroy) eval "terraform destroy -input=false -no-color -auto-approve $VAR_ARGS" ;;
+              plan)    terraform plan    -input=false -no-color ;;
+              apply)   terraform apply   -input=false -no-color -auto-approve ;;
+              destroy) terraform destroy -input=false -no-color -auto-approve ;;
               *) echo "Invalid action: $ACTION"; exit 1 ;;
             esac
           '
-      displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }}) - TFC-safe vendoring
+      displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }}) - vendoring + tfvars autoload for TFC
       env:
         TF_TOKEN_tf_puget_com: $(TERRAFORM_CLOUD_TOKEN)
         TERRAFORM_CLOUD_TOKEN: $(TERRAFORM_CLOUD_TOKEN)
