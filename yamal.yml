@@ -29,26 +29,33 @@
       PLAT_FLAG=""
     fi
 
-    # ---- Build a MAXIMAL corporate CA bundle from the host ----
+    # ---- Build a MAXIMAL corporate CA bundle from the host + optional extras ----
     CA_TMP="/tmp/combined-ca.pem"; : >"$CA_TMP"
-    add_if() { [ -s "$1" ] && cat "$1" >>"$CA_TMP"; }
+    add_if() { [ -s "$1" ] && grep -q "BEGIN CERTIFICATE" "$1" && cat "$1" >>"$CA_TMP" || true; }
 
+    # System bundles (varies by distro)
     add_if /etc/ssl/certs/ca-certificates.crt
     add_if /etc/pki/tls/certs/ca-bundle.crt
     add_if /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
     add_if /etc/ssl/cert.pem
 
-    # Any loose CRT/PEM anchors
-    for d in \
-      /usr/local/share/ca-certificates \
-      /etc/pki/ca-trust/source/anchors \
-      /etc/ssl/certs
-    do
+    # Per-cert anchors
+    for d in /usr/local/share/ca-certificates /etc/pki/ca-trust/source/anchors /etc/ssl/certs; do
       if [ -d "$d" ]; then
         find "$d" -maxdepth 1 \( -name '*.crt' -o -name '*.pem' \) -type f -size +1c -print0 \
-          | xargs -0 -I{} sh -c 'cat "{}" >>"'"$CA_TMP"'"'
+          | xargs -0 -I{} sh -c 'grep -q "BEGIN CERTIFICATE" "{}" && cat "{}" >>"'"$CA_TMP"'" || true'
       fi
     done
+
+    # (NEW) Optional: repo CA file (check in your corp root at ci/corp-ca.pem)
+    if [ -s ci/corp-ca.pem ]; then
+      cat ci/corp-ca.pem >>"$CA_TMP"
+    fi
+
+    # (NEW) Optional: pipeline secret CORP_CA_PEM_B64 (base64 of PEM)
+    if [ -n "${CORP_CA_PEM_B64:-}" ]; then
+      echo "$CORP_CA_PEM_B64" | base64 -d >>"$CA_TMP" || true
+    fi
 
     # Old 18.06 daemons: limits + relaxed seccomp
     LIMITS="--pids-limit 4096 --ulimit nproc=4096:8192 --ulimit nofile=65536:65536"
@@ -80,6 +87,7 @@
       -e REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem \
       -e GIT_SSL_CAINFO=/etc/ssl/certs/ca-corp-bundle.pem \
       -e AWS_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem \
+      -e BUNDLE_SSL_CA_CERT=/etc/ssl/certs/ca-corp-bundle.pem \
       -e TS_STACK="$TS_STACK" \
       -e TS_ENV_VAL="$TS_ENV_VAL" \
       -e TS_VERSION_CHECK=0 \
@@ -89,12 +97,10 @@
       -c '
         set -eu
 
-        # 1) FORCE the container-wide default OpenSSL bundle to the corporate bundle
-        #    (This avoids tool-by-tool env handling and helps Ruby/OpenSSL specifically.)
+        # 1) Force the container-wide OpenSSL bundle; provide both common paths.
         cp /etc/ssl/certs/ca-corp-bundle.pem /etc/ssl/certs/ca-certificates.crt || true
+        cp /etc/ssl/certs/ca-corp-bundle.pem /etc/ssl/cert.pem               || true
         if command -v c_rehash >/dev/null 2>&1; then c_rehash /etc/ssl/certs || true; fi
-
-        # Also keep git explicit
         git config --global http.sslCAInfo /etc/ssl/certs/ca-corp-bundle.pem || true
 
         # Use Terraspace’s embedded Ruby
@@ -140,3 +146,5 @@
     AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
     AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
     AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+    # (Optional) Put your corp root here as base64 (single or chain). Example creates it in the bundle.
+    # CORP_CA_PEM_B64: $(CORP_CA_PEM_B64)
