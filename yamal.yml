@@ -29,7 +29,7 @@
       PLAT_FLAG=""
     fi
 
-    # ------------------- NEW: build a combined corporate CA bundle -------------------
+    # --- Corporate CA bundle (combine host CAs) ---
     CA_TMP="/tmp/combined-ca.pem"; : >"$CA_TMP"
     for f in \
       /etc/ssl/certs/ca-certificates.crt \
@@ -41,17 +41,14 @@
     if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
       cat /usr/local/share/ca-certificates/*.crt >>"$CA_TMP"
     fi
-    # -------------------------------------------------------------------------------
 
-    # Old 18.06 daemons: give the container generous limits and relaxed seccomp
+    # Old 18.06 daemons: limits + relaxed seccomp
     LIMITS="--pids-limit 4096 --ulimit nproc=4096:8192 --ulimit nofile=65536:65536"
     SECURITY="--security-opt seccomp=unconfined --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE"
 
-    # Pass stack/env as discrete env vars so we can pre-init the cache inside the container
     TS_STACK="${{ parameters.tsStack }}"
     TS_ENV_VAL="${{ parameters.tsEnv }}"
 
-    # NOTE: DO NOT set BUNDLE_FORCE_RUBY_PLATFORM here (causes nokogiri solver errors)
     sudo docker run --rm $PLAT_FLAG $LIMITS $SECURITY \
       --entrypoint /bin/sh \
       -v "$(pwd)":/workspace \
@@ -62,15 +59,19 @@
       -e AWS_SECRET_ACCESS_KEY \
       -e AWS_SESSION_TOKEN \
       -e AWS_DEFAULT_REGION \
-      -e TS_STACK="$TS_STACK" -e TS_ENV_VAL="$TS_ENV_VAL" \
       -e TF_CLOUD_HOSTNAME=tf.puget.com \
       -e SSL_CERT_FILE=/etc/ssl/certs/ca-corp-bundle.pem \
       -e CURL_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem \
       -e REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem \
       -e GIT_SSL_CAINFO=/etc/ssl/certs/ca-corp-bundle.pem \
+      -e TS_STACK="$TS_STACK" \
+      -e TS_ENV_VAL="$TS_ENV_VAL" \
+      -e TS_VERSION_CHECK=0 \            # <-- bypass TS TF version gate
+      -e TFENV_AUTO_INSTALL=false \      # <-- stop tfenv from downloading TF
       ghcr.io/boltops-tools/terraspace:latest \
       -c '
         set -eu
+
         # Use Terraspace’s embedded Ruby
         export PATH=/opt/terraspace/embedded/bin:$PATH
         export GEM_HOME=/opt/terraspace/embedded/lib/ruby/gems/3.0.0
@@ -79,7 +80,7 @@
         export BUNDLE_RETRY=2
         unset BUNDLE_FORCE_RUBY_PLATFORM
 
-        # Make sure nokogiri matches the linux platform to avoid native build
+        # Ensure nokogiri is present but avoid native build by using linux platform binary
         if ! gem list -i nokogiri >/dev/null 2>&1; then
           gem install -N nokogiri -v 1.15.4 --platform x86_64-linux
         fi
@@ -89,16 +90,10 @@
           gem install -N terraspace_plugin_aws
         fi
 
-        # Pin Terraform to a TS-compatible version if tfenv is present; otherwise just show version
-        if command -v tfenv >/dev/null 2>&1; then
-          tfenv install 1.5.5 >/dev/null 2>&1 || true
-          tfenv use 1.5.5 || true
-        fi
-
         echo "Terraform in container:"; terraform -version
         echo "Terraspace version:"; /opt/terraspace/embedded/bin/terraspace -v
 
-        # ------------------- NEW: pre-build and terraform init (reconfigure) -------------------
+        # Pre-build & terraform init (reconfigure) so TFC is ready
         STACK="${TS_STACK:-vpc}"
         ENVN="${TS_ENV_VAL:-dev}"
         export TS_ENV="$ENVN"
@@ -109,9 +104,8 @@
           echo "--- terraform init (TFC reconfigure) ---"
           ( cd "$CACHE" && terraform init -reconfigure -upgrade -input=false -no-color )
         fi
-        # --------------------------------------------------------------------------------------
 
-        # Run Terraspace from the embedded bin explicitly
+        # Finally run the requested Terraspace action
         exec /opt/terraspace/embedded/bin/terraspace '"$TS_ARGS"'
       '
   displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }})
