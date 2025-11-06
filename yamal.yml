@@ -61,9 +61,11 @@
       -e AWS_DEFAULT_REGION \
       -e TF_CLOUD_HOSTNAME=tf.puget.com \
       -e SSL_CERT_FILE=/etc/ssl/certs/ca-corp-bundle.pem \
+      -e SSL_CERT_DIR=/etc/ssl/certs \
       -e CURL_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem \
       -e REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem \
       -e GIT_SSL_CAINFO=/etc/ssl/certs/ca-corp-bundle.pem \
+      -e AWS_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem \
       -e TS_STACK="$TS_STACK" \
       -e TS_ENV_VAL="$TS_ENV_VAL" \
       -e TS_VERSION_CHECK=0 \
@@ -71,6 +73,19 @@
       ghcr.io/boltops-tools/terraspace:latest \
       -c '
         set -eu
+
+        # Trust the corporate CA inside the container for ALL toolchains (Ruby/OpenSSL/curl/git/Terraform)
+        if command -v update-ca-certificates >/dev/null 2>&1; then
+          # Debian/Ubuntu
+          mkdir -p /usr/local/share/ca-certificates
+          cp /etc/ssl/certs/ca-corp-bundle.pem /usr/local/share/ca-certificates/corp-bundle.crt
+          update-ca-certificates || true
+        elif [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+          # Fallback: append to default bundle
+          cat /etc/ssl/certs/ca-corp-bundle.pem >> /etc/ssl/certs/ca-certificates.crt || true
+        fi
+        # Git also reads its own config occasionally
+        git config --global http.sslCAInfo /etc/ssl/certs/ca-corp-bundle.pem || true
 
         # Use Terraspace’s embedded Ruby
         export PATH=/opt/terraspace/embedded/bin:$PATH
