@@ -132,20 +132,20 @@ stages:
             ENVN="${TS_ENV_VAL:-dev}"
             ACTION="${TS_ACTION:-plan}"
 
-            # 1) Build once with Terraspace (produces .terraspace-cache/<region>/<env>/stacks/<stack>)
+            # 1) Build once with Terraspace
             export TS_ENV="$ENVN"
             /opt/terraspace/embedded/bin/terraspace build "$STACK"
 
             # 2) Locate stack dir (auto-detect region)
             STACK_DIR=$(ls -1d .terraspace-cache/*/"$ENVN"/stacks/"$STACK" 2>/dev/null | head -n1 || true)
             [ -n "$STACK_DIR" ] || { echo "ERROR: cannot locate Terraspace stack dir"; exit 1; }
-            ENV_ROOT=$(dirname "$(dirname "$STACK_DIR")")
+            ENV_ROOT=$(dirname "$(dirname "$STACK_DIR")")   # .terraspace-cache/<region>/<env>
             MOD_SRC="$ENV_ROOT/modules"
 
             echo "Using STACK_DIR=$STACK_DIR"
             echo "Using MOD_SRC=$MOD_SRC"
 
-            # 3) Vendor modules into stack and rewrite all module sources to ./modules/...
+            # 3) Vendor modules + rewrite sources to ./modules/...
             if [ -d "$MOD_SRC" ]; then
               rm -rf "$STACK_DIR/modules"; mkdir -p "$STACK_DIR/modules"
               cp -a "$MOD_SRC/." "$STACK_DIR/modules/"
@@ -153,11 +153,10 @@ stages:
                 "s|source[[:space:]]*=[[:space:]]*\"(\\.\\./)+modules/|source = \"./modules/|g"
             fi
 
-            # 4) Ensure variables are visible to TFC (auto-loaded from stack root)
+            # 4) Make ALL tfvars visible in stack root
             promote_tfvars_dir () {
               srcdir="$1"
               [ -d "$srcdir" ] || return 0
-              # copy ANY tfvars (auto or not) and rename to *.auto.tfvars*
               find "$srcdir" -maxdepth 1 -type f \( -name "*.tfvars" -o -name "*.tfvars.json" -o -name "*.auto.tfvars" -o -name "*.auto.tfvars.json" \) | while read -r f; do
                 base=$(basename "$f")
                 case "$base" in
@@ -170,11 +169,11 @@ stages:
               done
             }
 
-            # Promote tfvars created by Terraspace build
+            # Terraspace-generated tfvars (stack/env)
             promote_tfvars_dir "$STACK_DIR/tfvars"
             promote_tfvars_dir "$ENV_ROOT/tfvars"
 
-            # Bring in repo tfvars that look relevant (env/stack/generic)
+            # Repo tfvars (base/env/stack/etc.)
             copy_tfvar () {
               src="$1"
               base=$(basename "$src")
@@ -189,6 +188,7 @@ stages:
             for f in $(find /workspace -type f \
                          \( -name "*${ENVN}*.tfvars" -o -name "*${ENVN}*.tfvars.json" \
                             -o -name "*${STACK}*.tfvars" -o -name "*${STACK}*.tfvars.json" \
+                            -o -name "*base*.tfvars" -o -name "*base*.tfvars.json" \
                             -o -name "terraform.tfvars" \) \
                          ! -path "*/.terraspace-cache/*" | sort); do
               copy_tfvar "$f"; FOUND=1
@@ -200,7 +200,7 @@ stages:
               done
             fi
 
-            # Convert any TF_VAR_* envs into a tfvars file so TFC sees them
+            # Convert any TF_VAR_* envs into a tfvars file (remote runs won t see pipeline env)
             TF_ENV_FILE="$STACK_DIR/90_tf_env.auto.tfvars"
             : > "$TF_ENV_FILE"
             env | grep "^TF_VAR_" | while IFS="=" read -r name value; do
@@ -210,25 +210,30 @@ stages:
             done
             [ -s "$TF_ENV_FILE" ] || rm -f "$TF_ENV_FILE"
 
-            echo "TFVARS present in stack root:"
+            echo "TFVARS present in stack root (final):"
             ls -1 "$STACK_DIR"/*.tfvars* 2>/dev/null || echo "  (none)"
 
-            # 5) Run Terraform directly in built stack (CLI-driven TFC)
+            # 5) Build ordered -var-file list from EVERY tfvars in stack root
             cd "$STACK_DIR"
+            VAR_ARGS=""
+            for vf in $(ls -1 *.tfvars* 2>/dev/null | sort -V); do
+              VAR_ARGS="$VAR_ARGS -var-file=$vf"
+            done
+            echo "Using -var-file args:$VAR_ARGS"
+
             terraform init -input=false -no-color
             case "$ACTION" in
-              plan)    terraform plan    -input=false -no-color ;;
-              apply)   terraform apply   -input=false -no-color -auto-approve ;;
-              destroy) terraform destroy -input=false -no-color -auto-approve ;;
+              plan)    eval "terraform plan    -input=false -no-color $VAR_ARGS" ;;
+              apply)   eval "terraform apply   -input=false -no-color -auto-approve $VAR_ARGS" ;;
+              destroy) eval "terraform destroy -input=false -no-color -auto-approve $VAR_ARGS" ;;
               *) echo "Invalid action: $ACTION"; exit 1 ;;
             esac
           '
-      displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }}) - vendoring + tfvars autoload for TFC
+      displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }}) - vendoring + explicit tfvars ordering
       env:
         TF_TOKEN_tf_puget_com: $(TERRAFORM_CLOUD_TOKEN)
         TERRAFORM_CLOUD_TOKEN: $(TERRAFORM_CLOUD_TOKEN)
-        # Optional: set TF_VAR_* here if you want to feed variables from the pipeline
-        # Example:
+        # Optional: define TF_VAR_* here (will be written into 90_tf_env.auto.tfvars)
         # TF_VAR_bucket_name: my-dev-bucket-123
         AWS_ACCESS_KEY_ID:     $(AWS_ACCESS_KEY_ID)
         AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
