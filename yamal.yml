@@ -10,18 +10,12 @@ parameters:
   displayName: Environment
   type: string
   default: dev
-  values:
-  - dev
-  - stage
-  - prod
+  values: [dev, stage, prod]
 - name: action
   displayName: Action
   type: string
   default: plan
-  values:
-  - plan
-  - apply
-  - destroy
+  values: [plan, apply, destroy]
 - name: awsRegion
   displayName: AWS Region
   type: string
@@ -36,7 +30,7 @@ stages:
   jobs:
   - job: Run
     pool:
-      name: dataengineering_tf   # your self-hosted pool
+      name: dataengineering_tf
 
     steps:
     - checkout: self
@@ -45,7 +39,7 @@ stages:
     - bash: |
         set -euo pipefail
 
-        # Start Docker if systemd is available (self-hosted agents)
+        # Start Docker if available
         if command -v systemctl >/dev/null 2>&1; then
           sudo systemctl start docker || true
         fi
@@ -59,13 +53,13 @@ stages:
           PLAT_FLAG="--platform=linux/amd64"
         fi
 
-        # Pull image (retry without --platform if first pull fails)
+        # Pull image (retry without --platform if needed)
         if ! sudo docker pull $PLAT_FLAG ghcr.io/boltops-tools/terraspace:latest; then
           sudo docker pull ghcr.io/boltops-tools/terraspace:latest
           PLAT_FLAG=""
         fi
 
-        # Build a combined CA bundle (handles corp MITM proxies)
+        # Build a combined CA bundle (corp CA + system CA)
         CA_TMP="/tmp/combined-ca.pem"
         : >"$CA_TMP"
         for f in \
@@ -86,7 +80,6 @@ stages:
         TS_STACK="${{ parameters.tsStack }}"
         TS_ENV_VAL="${{ parameters.tsEnv }}"
 
-        # NOTE: Adjust -w to your Terraspace root if needed.
         sudo docker run --rm $PLAT_FLAG $LIMITS $SECURITY \
           --entrypoint /bin/sh \
           -v "$(pwd)":/workspace \
@@ -94,6 +87,7 @@ stages:
           -w /workspace/terraspace \
           -e TF_CLOUD_HOSTNAME=tf.puget.com \
           -e TF_TOKEN_tf_puget_com \
+          -e TERRAFORM_CLOUD_TOKEN \
           -e AWS_ACCESS_KEY_ID \
           -e AWS_SECRET_ACCESS_KEY \
           -e AWS_SESSION_TOKEN \
@@ -111,17 +105,15 @@ stages:
           -c '
             set -eu
 
-            # --- Trust corporate CA inside the container so Terraform trusts tf.puget.com ---
+            # --- Trust corporate CA (for tf.puget.com) ---
             if [ -s /etc/ssl/certs/ca-corp-bundle.pem ]; then
               mkdir -p /usr/local/share/ca-certificates
               cp /etc/ssl/certs/ca-corp-bundle.pem /usr/local/share/ca-certificates/zz_corp-ca.crt
               if command -v update-ca-certificates >/dev/null 2>&1; then
                 update-ca-certificates
               else
-                # Fallback if helper is missing
                 cat /usr/local/share/ca-certificates/zz_corp-ca.crt >> /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true
               fi
-              # Point common consumers at the unified store
               export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
               export SSL_CERT_DIR=/etc/ssl/certs
               export CURL_CA_BUNDLE="$SSL_CERT_FILE"
@@ -130,12 +122,31 @@ stages:
             fi
             # --- end CA trust ---
 
+            # --- Write Terraform credentials to avoid interactive "terraform login" ---
+            TF_HOST="${TF_CLOUD_HOSTNAME:-tf.puget.com}"
+            TF_TOKEN_VALUE="${TF_TOKEN_tf_puget_com:-${TERRAFORM_CLOUD_TOKEN:-}}"
+            if [ -z "${TF_TOKEN_VALUE}" ]; then
+              echo "ERROR: Terraform token missing. Provide TF_TOKEN_tf_puget_com or TERRAFORM_CLOUD_TOKEN." >&2
+              exit 1
+            fi
+            mkdir -p /root/.terraform.d
+            cat > /root/.terraform.d/credentials.tfrc.json <<EOF
+{
+  "credentials": {
+    "${TF_HOST}": {
+      "token": "${TF_TOKEN_VALUE}"
+    }
+  }
+}
+EOF
+            export TF_CLI_CONFIG_FILE=/root/.terraform.d/credentials.tfrc.json
+            # --- end credentials ---
+
             export PATH=/opt/terraspace/embedded/bin:$PATH
             export GEM_HOME=/opt/terraspace/embedded/lib/ruby/gems/3.0.0
             export GEM_PATH=$GEM_HOME
             export BUNDLE_JOBS=1 BUNDLE_RETRY=2
 
-            # Ensure needed gems are present inside the image
             gem list -i nokogiri >/dev/null 2>&1 || gem install -N nokogiri -v 1.15.4 --platform x86_64-linux
             gem list -i terraspace_plugin_aws >/dev/null 2>&1 || gem install -N terraspace_plugin_aws
 
@@ -147,7 +158,7 @@ stages:
             ENVN="${TS_ENV_VAL:-dev}"
             ACTION="${TS_ACTION:-plan}"
 
-            # Build (no --env here, use TS_ENV)
+            # Build (no --env here; we use TS_ENV)
             export TS_ENV="$ENVN"
             /opt/terraspace/embedded/bin/terraspace build "$STACK"
 
@@ -172,10 +183,11 @@ stages:
                 ;;
             esac
           '
-      displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }}) - CA + pre-init + safe quoting
+      displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }}) - CA + noninteractive TFC auth
       env:
-        TF_TOKEN_tf_puget_com: $(TERRAFORM_CLOUD_TOKEN)
+        TF_TOKEN_tf_puget_com: $(TERRAFORM_CLOUD_TOKEN)   # token for tf.puget.com
+        TERRAFORM_CLOUD_TOKEN: $(TERRAFORM_CLOUD_TOKEN)   # same token, used to author credentials file
         AWS_ACCESS_KEY_ID:     $(AWS_ACCESS_KEY_ID)
         AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-        AWS_SESSION_TOKEN:     $(AWS_SESSION_TOKEN)       # optional (STS)
+        AWS_SESSION_TOKEN:     $(AWS_SESSION_TOKEN)       # optional
         AWS_DEFAULT_REGION:    ${{ parameters.awsRegion }}
