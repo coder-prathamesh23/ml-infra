@@ -55,12 +55,12 @@ variable "default_space_security_groups" {
   description = "Security groups for default space settings"
 }
 
-variable "default_space_default_ebs_volume_size_in_gb" {
+variable "default_space_default_volume_size" {
   type        = number
   description = "Default EBS volume size (GB) for spaces"
 }
 
-variable "default_space_maximum_ebs_volume_size_in_gb" {
+variable "default_space_maximum_volume_size" {
   type        = number
   description = "Maximum EBS volume size (GB) for spaces"
 }
