@@ -217,5 +217,3 @@ variable "domain_security_group_ids" {
   type        = list(string)
   description = "Security groups for domain settings"
 }
-
-
