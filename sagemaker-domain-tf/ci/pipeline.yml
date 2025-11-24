@@ -1,0 +1,124 @@
+trigger: none
+pr: none
+
+# ---------- PARAMETERS ----------
+parameters:
+- name: tfEnv
+  displayName: Environment
+  type: string
+  default: dev
+  values:
+  - dev
+  - stage
+  - prod
+
+- name: action
+  displayName: Terraform Action
+  type: string
+  default: plan
+  values:
+  - plan
+  - apply
+  - destroy
+
+
+variables:
+- ${{ if eq(parameters.tfEnv, 'dev') }}:
+  - group: tf-sagemaker-dev
+- ${{ if eq(parameters.tfEnv, 'stage') }}:
+  - group: tf-sagemaker-stage
+- ${{ if eq(parameters.tfEnv, 'prod') }}:
+  - group: tf-sagemaker-prod
+
+stages:
+- stage: Terraform
+  displayName: Terraform ${{ parameters.action }} (${{ parameters.tfEnv }})
+  jobs:
+  - job: RunTerraform
+    displayName: Run Terraform
+    pool:
+      name: dataengineering_tf     # self-hosted agent with terraform installed
+
+    steps:
+    - checkout: self
+      fetchDepth: 0
+
+    - bash: |
+        set -euo pipefail
+
+        echo "=== Terraform pipeline start ==="
+        echo "Selected env: ${{ parameters.tfEnv }}"
+        echo "Selected action: ${{ parameters.action }}"
+
+        # Repo root (this YAML sits at repo root alongside modules/ and envs/)
+        REPO_ROOT="$(Build.SourcesDirectory)"
+
+        # Environment directory (envs/dev, envs/stage, envs/prod)
+        TF_ENV="${{ parameters.tfEnv }}"
+        ENV_DIR="$REPO_ROOT/envs/$TF_ENV"
+
+        if [ ! -d "$ENV_DIR" ]; then
+          echo "ERROR: Env directory not found: $ENV_DIR"
+          exit 1
+        fi
+
+        echo "Using ENV_DIR=$ENV_DIR"
+
+        # ----- 1) Copy modules into selected env -----
+        # IMPORTANT: In envs/*/main.tf, your module must use:
+        #   source = "./modules/sagemaker"
+        echo "Syncing modules/ into $ENV_DIR/modules ..."
+        rm -rf "$ENV_DIR/modules"
+        mkdir -p "$ENV_DIR/modules"
+        cp -R "$REPO_ROOT/modules/"* "$ENV_DIR/modules/"
+
+        echo "Modules now present at:"
+        ls -R "$ENV_DIR/modules" || true
+
+        # ----- 2) Terraform init + plan/apply/destroy -----
+        cd "$ENV_DIR"
+
+        # Wire the token for tf.puget.com into Terraform CLI.
+        # TERRAFORM_CLOUD_TOKEN comes from the variable group.
+        if [ -n "${TERRAFORM_CLOUD_TOKEN:-}" ]; then
+          export TF_CLOUD_TOKEN="$TERRAFORM_CLOUD_TOKEN"
+          export TF_TOKEN_tf_puget_com="$TERRAFORM_CLOUD_TOKEN"
+        fi
+
+        echo "Running terraform init in $ENV_DIR ..."
+        terraform init -input=false -no-color
+
+        ACTION="${{ parameters.action }}"
+
+        case "$ACTION" in
+          plan)
+            echo "Running terraform plan ..."
+            terraform plan -input=false -no-color
+            ;;
+          apply)
+            echo "Running terraform apply ..."
+            terraform apply -input=false -auto-approve -no-color
+            ;;
+          destroy)
+            echo "Running terraform destroy ..."
+            terraform destroy -input=false -auto-approve -no-color
+            ;;
+          *)
+            echo "Invalid action: $ACTION"
+            exit 1
+            ;;
+        esac
+
+        echo "=== Terraform pipeline end ==="
+      displayName: Terraform ${{ parameters.action }} (${{ parameters.tfEnv }})
+      env:
+        # From the selected variable group (per env/account)
+        AWS_ACCESS_KEY_ID:     $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_SESSION_TOKEN:     $(AWS_SESSION_TOKEN)
+        AWS_DEFAULT_REGION:    $(AWS_DEFAULT_REGION)
+
+        # Terraform Cloud/Enterprise token for tf.puget.com
+        TERRAFORM_CLOUD_TOKEN: $(TERRAFORM_CLOUD_TOKEN)
+        # Host-specific token env for tf.puget.com (hostname with dots → underscores)
+        TF_TOKEN_tf_puget_com: $(TERRAFORM_CLOUD_TOKEN)
