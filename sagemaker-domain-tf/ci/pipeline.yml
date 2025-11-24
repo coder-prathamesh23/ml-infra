@@ -21,7 +21,18 @@ parameters:
   - apply
   - destroy
 
-
+# ---------- VARIABLE GROUPS (ONE PER ENV) ----------
+# Make sure these group names exist in ADO:
+#   - tf-sagemaker-dev
+#   - tf-sagemaker-stage
+#   - tf-sagemaker-prod
+#
+# Each group should contain at least:
+#   AWS_ACCESS_KEY_ID
+#   AWS_SECRET_ACCESS_KEY
+#   AWS_SESSION_TOKEN        (optional)
+#   AWS_DEFAULT_REGION
+#   TERRAFORM_CLOUD_TOKEN    (token for tf.puget.com, org "DataScience")
 variables:
 - ${{ if eq(parameters.tfEnv, 'dev') }}:
   - group: tf-sagemaker-dev
@@ -52,6 +63,7 @@ stages:
 
         # Repo root (this YAML sits at repo root alongside modules/ and envs/)
         REPO_ROOT="$(Build.SourcesDirectory)"
+        echo "REPO_ROOT=$REPO_ROOT"
 
         # Environment directory (envs/dev, envs/stage, envs/prod)
         TF_ENV="${{ parameters.tfEnv }}"
@@ -64,13 +76,18 @@ stages:
 
         echo "Using ENV_DIR=$ENV_DIR"
 
-        # ----- 1) Copy modules into selected env -----
-        # IMPORTANT: In envs/*/main.tf, your module must use:
-        #   source = "./modules/sagemaker"
+        # ----- 1) Ensure modules exist and copy into selected env -----
+        if [ ! -d "$REPO_ROOT/modules" ]; then
+          echo "ERROR: modules/ directory not found at $REPO_ROOT/modules"
+          echo "Repo layout should be: sagemaker-domain-tf/modules/sagemaker/..."
+          exit 1
+        fi
+
         echo "Syncing modules/ into $ENV_DIR/modules ..."
         rm -rf "$ENV_DIR/modules"
-        mkdir -p "$ENV_DIR/modules"
-        cp -R "$REPO_ROOT/modules/"* "$ENV_DIR/modules/"
+        # This copies the whole 'modules' folder as a subdir of the env:
+        # envs/dev/modules/sagemaker/...
+        cp -R "$REPO_ROOT/modules" "$ENV_DIR/"
 
         echo "Modules now present at:"
         ls -R "$ENV_DIR/modules" || true
@@ -120,5 +137,4 @@ stages:
 
         # Terraform Cloud/Enterprise token for tf.puget.com
         TERRAFORM_CLOUD_TOKEN: $(TERRAFORM_CLOUD_TOKEN)
-        # Host-specific token env for tf.puget.com (hostname with dots → underscores)
         TF_TOKEN_tf_puget_com: $(TERRAFORM_CLOUD_TOKEN)
