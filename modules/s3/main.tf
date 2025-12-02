@@ -1,12 +1,9 @@
 ################################
-# S3 Buckets for SageMaker artifacts (multiple)
+# S3 Bucket for SageMaker artifacts
 ################################
 
 resource "aws_s3_bucket" "mlops_artifacts" {
-  # One instance per bucket name
-  for_each = toset(var.artifact_bucket_names)
-
-  bucket        = each.value
+  bucket        = var.artifact_bucket_name
   force_destroy = true
 }
 
@@ -15,10 +12,7 @@ resource "aws_s3_bucket" "mlops_artifacts" {
 ################################
 
 resource "aws_s3_bucket_ownership_controls" "ownership" {
-  # Match one-to-one with buckets
-  for_each = aws_s3_bucket.mlops_artifacts
-
-  bucket = each.value.id
+  bucket = aws_s3_bucket.mlops_artifacts.id
 
   rule {
     object_ownership = "BucketOwnerPreferred"
@@ -26,17 +20,13 @@ resource "aws_s3_bucket_ownership_controls" "ownership" {
 }
 
 ################################
-# Private ACL
+# Private assume_role_policy
 ################################
 
 resource "aws_s3_bucket_acl" "private_acl" {
-  for_each = aws_s3_bucket.mlops_artifacts
-
-  # Ensure ownership controls are applied first for this bucket
-  depends_on = [aws_s3_bucket_ownership_controls.ownership[each.key]]
-
-  bucket = each.value.id
-  acl    = "private"
+  depends_on = [aws_s3_bucket_ownership_controls.ownership]
+  bucket     = aws_s3_bucket.mlops_artifacts.id
+  acl        = "private"
 }
 
 ################################
@@ -44,9 +34,7 @@ resource "aws_s3_bucket_acl" "private_acl" {
 ################################
 
 resource "aws_s3_bucket_versioning" "versioning" {
-  for_each = aws_s3_bucket.mlops_artifacts
-
-  bucket = each.value.id
+  bucket = aws_s3_bucket.mlops_artifacts.id
 
   versioning_configuration {
     status = "Enabled"
@@ -58,9 +46,7 @@ resource "aws_s3_bucket_versioning" "versioning" {
 ################################
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "encryption" {
-  for_each = aws_s3_bucket.mlops_artifacts
-
-  bucket = each.value.id
+  bucket = aws_s3_bucket.mlops_artifacts.id
 
   rule {
     apply_server_side_encryption_by_default {
@@ -74,12 +60,38 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "encryption" {
 ################################
 
 resource "aws_s3_bucket_public_access_block" "public_access" {
-  for_each = aws_s3_bucket_mlops_artifacts
-
-  bucket = each.value.id
-
+  bucket                  = aws_s3_bucket.mlops_artifacts.id
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
+}
+
+################################
+# SageMaker Access Policy
+################################
+
+resource "aws_s3_bucket_policy" "sagemaker_policy" {
+  bucket = aws_s3_bucket.mlops_artifacts.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowSageMakerAccess"
+        Effect = "Allow"
+        Principal = {
+          Service = "sagemaker.amazonaws.com"
+        }
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:ListBucket",
+        ]
+        Resource = [
+          aws_s3_bucket.mlops_artifacts.arn,
+          "${aws_s3_bucket.mlops_artifacts.arn}/*"
+        ]
+      }
+    ]
+  })
 }
