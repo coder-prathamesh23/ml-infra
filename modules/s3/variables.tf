@@ -1,10 +1,4 @@
-variable "artifact_bucket_name" {
-  description = "Name for the S3 bucket used by SageMaker"
-  type        = string
-}
-
-variable "tags" {
-  description = "Resource tags"
-  type        = map(string)
-  default     = {}
+variable "artifact_bucket_names" {
+  description = "List of S3 bucket names for SageMaker artifacts"
+  type        = list(string)
 }
