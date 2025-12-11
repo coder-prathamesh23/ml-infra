@@ -1,150 +1,67 @@
-- bash: |
-    set -euo pipefail
+# azure-pipelines-sagemaker.yml
+# Triggers: manual only (no automatic run on push)
+trigger: none
 
-    # Start Docker if present (self-hosted)
-    if command -v systemctl >/dev/null 2>&1; then
-      sudo systemctl start docker || true
-    fi
-    sudo docker version
+# Use your existing pool here.
+# If you use Microsoft-hosted agents, do:
+#   pool:
+#     vmImage: 'ubuntu-latest'
+# If you use self-hosted:
+#   pool:
+#     name: your_pool_name
+pool:
+  name: az_data_engineering2   # <--- CHANGE to whatever you currently use
 
-    cd "$(Build.SourcesDirectory)"
+# Variable group with AWS credentials + region
+variables:
+- group: AWS-ML-Dev            # <--- CHANGE if your group has a different name
 
-    # Build the Terraspace command from parameters
-    case "${{ parameters.action }}" in
-      plan)    TS_ARGS="plan    '${{ parameters.tsStack }}' --env '${{ parameters.tsEnv }}' --no-color" ;;
-      apply)   TS_ARGS="up      '${{ parameters.tsStack }}' --env '${{ parameters.tsEnv }}' -y --no-color" ;;
-      destroy) TS_ARGS="down    '${{ parameters.tsStack }}' --env '${{ parameters.tsEnv }}' -y --no-color" ;;
-      *) echo "Invalid action: ${{ parameters.action }}"; exit 1 ;;
-    esac
+stages:
+- stage: RunSageMakerPipeline
+  displayName: "Run SageMaker Pipeline"
+  jobs:
+  - job: RunPipeline
+    displayName: "Trigger Early Crew Dispatch Pipeline"
+    steps:
 
-    # Old Docker may not accept --platform; probe support
-    PLAT_FLAG=""
-    if sudo docker run --help 2>&1 | grep -q -- '--platform'; then
-      PLAT_FLAG="--platform=linux/amd64"
-    fi
+    # 1) Detect which Python is available and store it in $(PYTHON_CMD)
+    - script: |
+        echo "Detecting Python on this agent..."
 
-    # Pull Terraspace image (fallback without --platform if needed)
-    if ! sudo docker pull $PLAT_FLAG ghcr.io/boltops-tools/terraspace:latest ; then
-      sudo docker pull ghcr.io/boltops-tools/terraspace:latest
-      PLAT_FLAG=""
-    fi
-
-    # ---- Build a MAXIMAL corporate CA bundle from the host + optional extras ----
-    CA_TMP="/tmp/combined-ca.pem"; : >"$CA_TMP"
-    add_if() { [ -s "$1" ] && grep -q "BEGIN CERTIFICATE" "$1" && cat "$1" >>"$CA_TMP" || true; }
-
-    # System bundles (varies by distro)
-    add_if /etc/ssl/certs/ca-certificates.crt
-    add_if /etc/pki/tls/certs/ca-bundle.crt
-    add_if /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
-    add_if /etc/ssl/cert.pem
-
-    # Per-cert anchors
-    for d in /usr/local/share/ca-certificates /etc/pki/ca-trust/source/anchors /etc/ssl/certs; do
-      if [ -d "$d" ]; then
-        find "$d" -maxdepth 1 \( -name '*.crt' -o -name '*.pem' \) -type f -size +1c -print0 \
-          | xargs -0 -I{} sh -c 'grep -q "BEGIN CERTIFICATE" "{}" && cat "{}" >>"'"$CA_TMP"'" || true'
-      fi
-    done
-
-    # (NEW) Optional: repo CA file (check in your corp root at ci/corp-ca.pem)
-    if [ -s ci/corp-ca.pem ]; then
-      cat ci/corp-ca.pem >>"$CA_TMP"
-    fi
-
-    # (NEW) Optional: pipeline secret CORP_CA_PEM_B64 (base64 of PEM)
-    if [ -n "${CORP_CA_PEM_B64:-}" ]; then
-      echo "$CORP_CA_PEM_B64" | base64 -d >>"$CA_TMP" || true
-    fi
-
-    # Old 18.06 daemons: limits + relaxed seccomp
-    LIMITS="--pids-limit 4096 --ulimit nproc=4096:8192 --ulimit nofile=65536:65536"
-    SECURITY="--security-opt seccomp=unconfined --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE"
-
-    TS_STACK="${{ parameters.tsStack }}"
-    TS_ENV_VAL="${{ parameters.tsEnv }}"
-
-    # Pass proxies through if defined on the agent (handles corp MITM)
-    PROXY_ENVS=()
-    for v in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy NO_PROXY no_proxy; do
-      if env | grep -q "^$v="; then PROXY_ENVS+=( -e "$v" ); fi
-    done
-
-    sudo docker run --rm $PLAT_FLAG $LIMITS $SECURITY \
-      --entrypoint /bin/sh \
-      -v "$(pwd)":/workspace \
-      -v "$CA_TMP":/etc/ssl/certs/ca-corp-bundle.pem:ro \
-      -w /workspace/terraspace \
-      -e TF_TOKEN_tf_puget_com \
-      -e AWS_ACCESS_KEY_ID \
-      -e AWS_SECRET_ACCESS_KEY \
-      -e AWS_SESSION_TOKEN \
-      -e AWS_DEFAULT_REGION \
-      -e TF_CLOUD_HOSTNAME=tf.puget.com \
-      -e SSL_CERT_FILE=/etc/ssl/certs/ca-corp-bundle.pem \
-      -e SSL_CERT_DIR=/etc/ssl/certs \
-      -e CURL_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem \
-      -e REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem \
-      -e GIT_SSL_CAINFO=/etc/ssl/certs/ca-corp-bundle.pem \
-      -e AWS_CA_BUNDLE=/etc/ssl/certs/ca-corp-bundle.pem \
-      -e BUNDLE_SSL_CA_CERT=/etc/ssl/certs/ca-corp-bundle.pem \
-      -e TS_STACK="$TS_STACK" \
-      -e TS_ENV_VAL="$TS_ENV_VAL" \
-      -e TS_VERSION_CHECK=0 \
-      -e TFENV_AUTO_INSTALL=false \
-      "${PROXY_ENVS[@]}" \
-      ghcr.io/boltops-tools/terraspace:latest \
-      -c '
-        set -eu
-
-        # 1) Force the container-wide OpenSSL bundle; provide both common paths.
-        cp /etc/ssl/certs/ca-corp-bundle.pem /etc/ssl/certs/ca-certificates.crt || true
-        cp /etc/ssl/certs/ca-corp-bundle.pem /etc/ssl/cert.pem               || true
-        if command -v c_rehash >/dev/null 2>&1; then c_rehash /etc/ssl/certs || true; fi
-        git config --global http.sslCAInfo /etc/ssl/certs/ca-corp-bundle.pem || true
-
-        # Use Terraspace’s embedded Ruby
-        export PATH=/opt/terraspace/embedded/bin:$PATH
-        export GEM_HOME=/opt/terraspace/embedded/lib/ruby/gems/3.0.0
-        export GEM_PATH=$GEM_HOME
-        export BUNDLE_JOBS=1
-        export BUNDLE_RETRY=2
-        unset BUNDLE_FORCE_RUBY_PLATFORM
-
-        # Ensure nokogiri using linux binary, avoid native build on old Docker
-        if ! gem list -i nokogiri >/dev/null 2>&1; then
-          gem install -N nokogiri -v 1.15.4 --platform x86_64-linux
+        if command -v python3 >/dev/null 2>&1; then
+          echo "Using python3"
+          echo "##vso[task.setvariable variable=PYTHON_CMD]python3"
+          python3 --version
+        elif command -v python >/dev/null 2>&1; then
+          echo "Using python"
+          echo "##vso[task.setvariable variable=PYTHON_CMD]python"
+          python --version
+        else
+          echo "ERROR: No Python interpreter found on PATH."
+          exit 1
         fi
+      displayName: "Detect Python interpreter"
 
-        # Ensure AWS plugin is available
-        if ! gem list -i terraspace_plugin_aws >/dev/null 2>&1; then
-          gem install -N terraspace_plugin_aws
-        fi
+    # 2) Install dependencies using the detected Python
+    - script: |
+        echo "Installing dependencies with $(PYTHON_CMD)..."
 
-        echo "Terraform in container:"; terraform -version
-        echo "Terraspace version:"; /opt/terraspace/embedded/bin/terraspace -v
+        $(PYTHON_CMD) -m pip install --upgrade pip
+        $(PYTHON_CMD) -m pip install -r requirements39.txt
+      displayName: "Install Python dependencies (requirements39.txt)"
 
-        # Pre-build & terraform init (reconfigure) so TFC is ready
-        STACK="${TS_STACK:-vpc}"
-        ENVN="${TS_ENV_VAL:-dev}"
-        export TS_ENV="$ENVN"
-        /opt/terraspace/embedded/bin/terraspace build "$STACK"
+    # 3) Export AWS creds, set PYTHONPATH, run run_pipeline.py
+    - script: |
+        echo "Setting AWS environment variables..."
 
-        CACHE=".terraspace-cache/$ENVN/stacks/$STACK"
-        if [ -d "$CACHE" ]; then
-          echo "--- terraform init (TFC reconfigure) ---"
-          ( cd "$CACHE" && terraform init -reconfigure -upgrade -input=false -no-color )
-        fi
+        export AWS_ACCESS_KEY_ID=$(AWS_ACCESS_KEY_ID)
+        export AWS_SECRET_ACCESS_KEY=$(AWS_SECRET_ACCESS_KEY)
+        export AWS_SESSION_TOKEN=$(AWS_SESSION_TOKEN)
+        export AWS_DEFAULT_REGION=$(AWS_DEFAULT_REGION)
 
-        # Finally run the requested Terraspace action
-        exec /opt/terraspace/embedded/bin/terraspace '"$TS_ARGS"'
-      '
-  displayName: Terraspace ${{ parameters.action }} (${{ parameters.tsStack }} / ${{ parameters.tsEnv }})
-  env:
-    TF_TOKEN_tf_puget_com: $(TERRAFORM_CLOUD_TOKEN)
-    AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-    AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-    AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
-    AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
-    # (Optional) Put your corp root here as base64 (single or chain). Example creates it in the bundle.
-    # CORP_CA_PEM_B64: $(CORP_CA_PEM_B64)
+        echo "Setting PYTHONPATH so imports work..."
+        export PYTHONPATH="$PWD/early_crew_dispatch"
+
+        echo "Running SageMaker pipeline with $(PYTHON_CMD)..."
+        $(PYTHON_CMD) early_crew_dispatch/run_pipeline.py
+      displayName: "Run run_pipeline.py (trigger SageMaker pipeline)"
