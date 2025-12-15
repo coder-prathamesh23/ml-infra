@@ -105,6 +105,7 @@ stages:
         AWS_DEFAULT_REGION: $(AWS_REGION)
 
     # Step 4: Run container, mount repo, execute run_pipeline.py inside it
+    # Step 4: Run container, mount repo, execute run_pipeline.py inside it
     - script: |
         set -e
 
@@ -133,7 +134,7 @@ stages:
         export ROLE_AWS_SESSION_TOKEN="$ROLE_TOKEN"
 
         echo ""
-        echo "Identity after assume-role (should be assumed-role/SageMaker-ExecutionRole-...):"
+        echo "Identity after assume-role (should be assumed-role/SageMaker-ExecutionRole-Admin/...):"
         AWS_ACCESS_KEY_ID=$ROLE_AWS_ACCESS_KEY_ID \
         AWS_SECRET_ACCESS_KEY=$ROLE_AWS_SECRET_ACCESS_KEY \
         AWS_SESSION_TOKEN=$ROLE_AWS_SESSION_TOKEN \
@@ -154,8 +155,9 @@ stages:
           -e NUMEXPR_NUM_THREADS=1 \
           -e PYTHONPATH=/workspace/early_crew_dispatch \
           -v "$WORKSPACE":/workspace \
+          -w /workspace/early_crew_dispatch/ml_pipeline \
           $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/early-crew-dispatch-base:latest \
-          python early_crew_dispatch/run_pipeline.py
+          python ../run_pipeline.py
       displayName: "Mount repo & run run_pipeline.py in container"
       env:
         # IAM user credentials – used only to call sts:AssumeRole
