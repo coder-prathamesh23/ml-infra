@@ -2,10 +2,10 @@
 trigger: none
 
 pool:
-  name: dataengineering_2        # your self-hosted agent pool
+  name: dataengineering_tf        # your self-hosted agent pool
 
 variables:
-- group: tf-sagemaker-dev       # variable group with your AWS creds
+- group:        # variable group with your AWS creds
 
 # Expected variables in tf-sagemaker-dev:
 #   AWS_ACCOUNT_ID        = <12-digit ECR account ID>  (the 3... account)
@@ -107,13 +107,45 @@ stages:
     # Step 4: Run container, mount repo, execute run_pipeline.py inside it
     - script: |
         set -e
+
         echo "Running SageMaker pipeline inside container..."
 
         WORKSPACE="$(System.DefaultWorkingDirectory)"
 
+        echo "Base identity before assume-role (should be IAM user):"
+        aws sts get-caller-identity
+
+        echo ""
+        echo "Assuming SageMaker execution role: $SAGEMAKER_EXECUTION_ROLE_ARN"
+
+        # Call STS to assume the SageMaker execution role
+        CREDS=$(aws sts assume-role \
+          --role-arn "$SAGEMAKER_EXECUTION_ROLE_ARN" \
+          --role-session-name azdo-sagemaker-pipeline \
+          --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+          --output text)
+
+        # CREDS is: "AKIA... SECRET... TOKEN..."
+        read ROLE_AK ROLE_SK ROLE_TOKEN <<< "$CREDS"
+
+        export ROLE_AWS_ACCESS_KEY_ID="$ROLE_AK"
+        export ROLE_AWS_SECRET_ACCESS_KEY="$ROLE_SK"
+        export ROLE_AWS_SESSION_TOKEN="$ROLE_TOKEN"
+
+        echo ""
+        echo "Identity after assume-role (should be assumed-role/SageMaker-ExecutionRole-...):"
+        AWS_ACCESS_KEY_ID=$ROLE_AWS_ACCESS_KEY_ID \
+        AWS_SECRET_ACCESS_KEY=$ROLE_AWS_SECRET_ACCESS_KEY \
+        AWS_SESSION_TOKEN=$ROLE_AWS_SESSION_TOKEN \
+          aws sts get-caller-identity
+
+        echo ""
+        echo "Starting Docker container with assumed-role credentials..."
+
         docker run --rm \
-          -e AWS_ACCESS_KEY_ID=$(AWS_ACCESS_KEY_ID) \
-          -e AWS_SECRET_ACCESS_KEY=$(AWS_SECRET_ACCESS_KEY) \
+          -e AWS_ACCESS_KEY_ID=$ROLE_AWS_ACCESS_KEY_ID \
+          -e AWS_SECRET_ACCESS_KEY=$ROLE_AWS_SECRET_ACCESS_KEY \
+          -e AWS_SESSION_TOKEN=$ROLE_AWS_SESSION_TOKEN \
           -e AWS_REGION=$(AWS_REGION) \
           -e AWS_DEFAULT_REGION=$(AWS_REGION) \
           -e OPENBLAS_NUM_THREADS=1 \
@@ -122,14 +154,14 @@ stages:
           -e NUMEXPR_NUM_THREADS=1 \
           -e PYTHONPATH=/workspace/early_crew_dispatch \
           -v "$WORKSPACE":/workspace \
-          -w /workspace \
           $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/early-crew-dispatch-base:latest \
           python early_crew_dispatch/run_pipeline.py
       displayName: "Mount repo & run run_pipeline.py in container"
-
       env:
+        # IAM user credentials – used only to call sts:AssumeRole
         AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
         AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-        AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
         AWS_REGION: $(AWS_REGION)
         AWS_DEFAULT_REGION: $(AWS_REGION)
+        # Execution role to assume
+        SAGEMAKER_EXECUTION_ROLE_ARN: $(SAGEMAKER_EXECUTION_ROLE_ARN)
