@@ -1,122 +1,115 @@
+# azure-pipelines-infer-test.yml
 trigger: none
 pr: none
 
-schedules:
-  - cron: "*/5 * * * *"
-    displayName: "DEV: Run inference every 5 minutes (UTC)"
-    branches:
-      include:
-        - dev
-    always: true
-
 pool:
-  name: dataengineering_tf
+  name: dataengineering_tf   # self-hosted agent pool
 
 variables:
-  - group: tf-sagemaker-dev
+  - group: tf-sagemaker-dev  # change to tf-sagemaker-test / tf-sagemaker-prod as needed
 
 stages:
-- stage: Infer_DEV
-  displayName: "Inference - DEV"
+- stage: TestInference
+  displayName: "TEST RUN: infer_model.py in ECR container"
   jobs:
-  - deployment: RunInferDev
-    displayName: "Run infer_model.py (DEV) in ECR container"
-    environment: early-crew-dispatch-infer-dev   # Enable Exclusive lock on this Environment (UI)
-    strategy:
-      runOnce:
-        deploy:
-          steps:
-          - checkout: self
-            clean: true
-            displayName: "Checkout repo"
+  - job: RunInfer
+    displayName: "Run infer_model.py (normal job)"
+    timeoutInMinutes: 15
 
-          - script: |
-              set -euo pipefail
-              echo "=== DEBUG: Base identity (before assume-role) ==="
-              echo "Branch          = $(Build.SourceBranchName)"
-              echo "AWS_REGION      = $(AWS_REGION)"
-              echo "AWS_ACCOUNT_ID  = $(AWS_ACCOUNT_ID)"
-              aws sts get-caller-identity --region $(AWS_REGION)
-            displayName: "DEBUG – who am I (base creds)"
-            env:
-              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-              AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
-              AWS_REGION: $(AWS_REGION)
-              AWS_DEFAULT_REGION: $(AWS_REGION)
+    steps:
+    - checkout: self
+      clean: true
+      displayName: "Checkout repo"
 
-          - script: |
-              set -euo pipefail
+    - script: |
+        set -euo pipefail
+        echo "=== DEBUG: Base identity (before assume-role) ==="
+        echo "Branch          = $(Build.SourceBranchName)"
+        echo "AWS_REGION      = $(AWS_REGION)"
+        echo "AWS_ACCOUNT_ID  = $(AWS_ACCOUNT_ID)"
+        aws sts get-caller-identity --region $(AWS_REGION)
+      displayName: "DEBUG – who am I (base creds)"
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
+        AWS_REGION: $(AWS_REGION)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
 
-              REGISTRY="$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com"
-              IMAGE="$REGISTRY/early-crew-dispatch-base:latest"
+    - script: |
+        set -euo pipefail
 
-              echo "Logging into ECR: $REGISTRY"
+        REGISTRY="$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com"
+        IMAGE="$REGISTRY/early-crew-dispatch-base:latest"
 
-              if aws ecr get-login-password --region $(AWS_REGION) >/dev/null 2>&1; then
-                aws ecr get-login-password --region $(AWS_REGION) | \
-                  docker login --username AWS --password-stdin "$REGISTRY"
-              else
-                echo "get-login-password not available; using legacy get-login..."
-                LOGIN_CMD=$(aws ecr get-login --no-include-email --region $(AWS_REGION))
-                PASSWORD=$(echo "$LOGIN_CMD" | awk '{for (i=1;i<=NF;i++) if ($i=="-p" || $i=="--password") {print $(i+1); exit}}')
-                echo "$PASSWORD" | docker login --username AWS --password-stdin "$REGISTRY"
-              fi
+        echo "Logging into ECR: $REGISTRY"
 
-              echo "Pulling image: $IMAGE"
-              docker pull "$IMAGE"
-            displayName: "ECR login + pull base image"
-            env:
-              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-              AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
-              AWS_REGION: $(AWS_REGION)
-              AWS_DEFAULT_REGION: $(AWS_REGION)
+        # Prefer modern method; fallback to legacy get-login
+        if aws ecr get-login-password --region $(AWS_REGION) >/dev/null 2>&1; then
+          aws ecr get-login-password --region $(AWS_REGION) | \
+            docker login --username AWS --password-stdin "$REGISTRY"
+        else
+          echo "get-login-password not available; using legacy get-login..."
+          LOGIN_CMD=$(aws ecr get-login --no-include-email --region $(AWS_REGION))
+          PASSWORD=$(echo "$LOGIN_CMD" | awk '{for (i=1;i<=NF;i++) if ($i=="-p" || $i=="--password") {print $(i+1); exit}}')
+          echo "$PASSWORD" | docker login --username AWS --password-stdin "$REGISTRY"
+        fi
 
-          - script: |
-              set -euo pipefail
+        echo "Pulling image: $IMAGE"
+        docker pull "$IMAGE"
+      displayName: "ECR login + pull base image"
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
+        AWS_REGION: $(AWS_REGION)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
 
-              WORKSPACE="$(System.DefaultWorkingDirectory)"
-              REGISTRY="$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com"
-              IMAGE="$REGISTRY/early-crew-dispatch-base:latest"
+    - script: |
+        set -euo pipefail
 
-              echo "Assuming execution role:"
-              echo "  $SAGEMAKER_EXECUTION_ROLE_ARN"
+        WORKSPACE="$(System.DefaultWorkingDirectory)"
+        REGISTRY="$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com"
+        IMAGE="$REGISTRY/early-crew-dispatch-base:latest"
 
-              CREDS=$(aws sts assume-role \
-                --role-arn "$SAGEMAKER_EXECUTION_ROLE_ARN" \
-                --role-session-name azdo-infer-dev \
-                --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
-                --output text)
+        echo "Assuming execution role:"
+        echo "  $SAGEMAKER_EXECUTION_ROLE_ARN"
 
-              read ROLE_AK ROLE_SK ROLE_TOKEN <<< "$CREDS"
+        CREDS=$(aws sts assume-role \
+          --role-arn "$SAGEMAKER_EXECUTION_ROLE_ARN" \
+          --role-session-name azdo-infer-test-run \
+          --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+          --output text)
 
-              echo "=== DEBUG: Identity after assume-role ==="
-              AWS_ACCESS_KEY_ID=$ROLE_AK AWS_SECRET_ACCESS_KEY=$ROLE_SK AWS_SESSION_TOKEN=$ROLE_TOKEN \
-                aws sts get-caller-identity --region $(AWS_REGION)
+        read ROLE_AK ROLE_SK ROLE_TOKEN <<< "$CREDS"
 
-              echo "Running infer_model.py inside container..."
+        echo "=== DEBUG: Identity after assume-role ==="
+        AWS_ACCESS_KEY_ID=$ROLE_AK AWS_SECRET_ACCESS_KEY=$ROLE_SK AWS_SESSION_TOKEN=$ROLE_TOKEN \
+          aws sts get-caller-identity --region $(AWS_REGION)
 
-              docker run --rm \
-                -e AWS_ACCESS_KEY_ID="$ROLE_AK" \
-                -e AWS_SECRET_ACCESS_KEY="$ROLE_SK" \
-                -e AWS_SESSION_TOKEN="$ROLE_TOKEN" \
-                -e AWS_REGION="$(AWS_REGION)" \
-                -e AWS_DEFAULT_REGION="$(AWS_REGION)" \
-                -e OPENBLAS_NUM_THREADS=1 \
-                -e OMP_NUM_THREADS=1 \
-                -e MKL_NUM_THREADS=1 \
-                -e NUMEXPR_NUM_THREADS=1 \
-                -e PYTHONPATH="/workspace/early_crew_dispatch:/workspace/early_crew_dispatch/src" \
-                -v "$WORKSPACE":/workspace \
-                -w /workspace/early_crew_dispatch/src/models \
-                "$IMAGE" \
-                bash -lc "python -V && python -u infer_model.py"
-            displayName: "Run infer_model.py (DEV)"
-            env:
-              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)          # base creds only for sts + ecr
-              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-              AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
-              AWS_REGION: $(AWS_REGION)
-              AWS_DEFAULT_REGION: $(AWS_REGION)
-              SAGEMAKER_EXECUTION_ROLE_ARN: $(SAGEMAKER_EXECUTION_ROLE_ARN)
+        echo "Running infer_model.py inside container..."
+
+        docker run --rm \
+          -e AWS_ACCESS_KEY_ID="$ROLE_AK" \
+          -e AWS_SECRET_ACCESS_KEY="$ROLE_SK" \
+          -e AWS_SESSION_TOKEN="$ROLE_TOKEN" \
+          -e AWS_REGION="$(AWS_REGION)" \
+          -e AWS_DEFAULT_REGION="$(AWS_REGION)" \
+          -e OPENBLAS_NUM_THREADS=1 \
+          -e OMP_NUM_THREADS=1 \
+          -e MKL_NUM_THREADS=1 \
+          -e NUMEXPR_NUM_THREADS=1 \
+          -e PYTHONPATH="/workspace/early_crew_dispatch:/workspace/early_crew_dispatch/src" \
+          -v "$WORKSPACE":/workspace \
+          -w /workspace/early_crew_dispatch/src/models \
+          "$IMAGE" \
+          bash -lc "python -V && python -u infer_model.py"
+      displayName: "Run infer_model.py (container + assumed role)"
+      env:
+        # Base creds only used for sts:AssumeRole + ECR login/pull
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
+        AWS_REGION: $(AWS_REGION)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
+        SAGEMAKER_EXECUTION_ROLE_ARN: $(SAGEMAKER_EXECUTION_ROLE_ARN)
