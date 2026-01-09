@@ -167,3 +167,183 @@ stages:
         AWS_DEFAULT_REGION: $(AWS_REGION)
         # Execution role to assume
         SAGEMAKER_EXECUTION_ROLE_ARN: $(SAGEMAKER_EXECUTION_ROLE_ARN)
+
+
+import sys
+import boto3
+from urllib.parse import urlparse
+
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def s3_parse(s3_uri: str):
+    u = urlparse(s3_uri)
+    if u.scheme != "s3":
+        raise ValueError(f"Expected s3:// URI, got: {s3_uri}")
+    bucket = u.netloc
+    key = u.path.lstrip("/")
+    return bucket, key
+
+
+def s3_list_keys(bucket: str, prefix: str):
+    s3 = boto3.client("s3")
+    keys = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            keys.append(obj["Key"])
+    return keys
+
+
+def s3_has_parquet(bucket: str, prefix: str) -> bool:
+    s3 = boto3.client("s3")
+    resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=50)
+    for obj in resp.get("Contents", []):
+        if obj["Key"].endswith(".parquet"):
+            return True
+    return False
+
+
+def s3_delete_prefix(bucket: str, prefix: str):
+    s3 = boto3.client("s3")
+    keys = s3_list_keys(bucket, prefix)
+    if not keys:
+        return
+    for i in range(0, len(keys), 1000):
+        chunk = keys[i:i + 1000]
+        s3.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": [{"Key": k} for k in chunk]}
+        )
+
+
+def get_arg(argv, name, default=None):
+    flag = f"--{name}"
+    if flag in argv:
+        i = argv.index(flag)
+        if i + 1 < len(argv):
+            return argv[i + 1]
+    return default
+
+
+# -----------------------------
+# Required args
+# -----------------------------
+# Required:
+# --JOB_NAME
+# --src_base (s3://bucket/prefix/)
+# --dst_base (s3://bucket/prefix/)
+# --year --month --day
+req = ["JOB_NAME", "src_base", "dst_base", "year", "month", "day"]
+args = getResolvedOptions(sys.argv, req)
+
+# Optional:
+# --hour (e.g. 2)
+# --output_files (default 8; set 1 if you truly want single file output)
+hour = get_arg(sys.argv, "hour", None)
+output_files = int(get_arg(sys.argv, "output_files", "8"))
+
+src_base = args["src_base"].rstrip("/") + "/"
+dst_base = args["dst_base"].rstrip("/") + "/"
+
+# Numeric partition layout: YYYY/M/D/(H/)
+y = str(int(args["year"]))
+m = str(int(args["month"]))
+d = str(int(args["day"]))
+
+partition_path = f"{y}/{m}/{d}/"
+if hour is not None:
+    partition_path += f"{int(hour)}/"  # e.g. "2/"
+
+src_path = src_base + partition_path
+dst_final = dst_base + partition_path
+dst_tmp = dst_base + "_tmp/" + partition_path  # staging publish path
+
+print("========== COMPACTION INPUTS ==========")
+print(f"src_path     = {src_path}")
+print(f"dst_tmp      = {dst_tmp}")
+print(f"dst_final    = {dst_final}")
+print(f"output_files = {output_files}")
+print("=======================================")
+
+# Validate input exists (parquet files)
+src_bucket, src_prefix = s3_parse(src_path)
+if not s3_has_parquet(src_bucket, src_prefix):
+    print(f"No parquet found under {src_path}. Exiting without changes.")
+    sys.exit(0)
+
+# -----------------------------
+# Spark/Glue init
+# -----------------------------
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+job = Job(glueContext)
+job.init(args["JOB_NAME"], args)
+
+# Reasonable defaults
+spark.conf.set("spark.sql.parquet.mergeSchema", "false")
+spark.conf.set("spark.sql.files.ignoreCorruptFiles", "true")
+spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+
+# -----------------------------
+# Read raw parquet
+# -----------------------------
+df = spark.read.parquet(src_path)
+
+# -----------------------------
+# Reduce output file count
+# -----------------------------
+# coalesce reduces partitions without full shuffle; good for compaction output
+current_parts = df.rdd.getNumPartitions()
+if output_files <= 0:
+    raise ValueError("output_files must be >= 1")
+
+if output_files < current_parts:
+    df_out = df.coalesce(output_files)
+elif output_files > current_parts:
+    df_out = df.repartition(output_files)
+else:
+    df_out = df
+
+# -----------------------------
+# Write to TEMP
+# -----------------------------
+# Overwrite temp partition path so reruns are clean
+df_out.write.mode("overwrite").parquet(dst_tmp)
+
+# -----------------------------
+# Publish (TEMP -> FINAL)
+# -----------------------------
+dst_bucket, dst_prefix_final = s3_parse(dst_final)
+tmp_bucket, tmp_prefix = s3_parse(dst_tmp)
+
+s3 = boto3.client("s3")
+
+# Delete existing FINAL partition
+s3_delete_prefix(dst_bucket, dst_prefix_final)
+
+# Copy objects from TEMP -> FINAL
+tmp_keys = s3_list_keys(tmp_bucket, tmp_prefix)
+for k in tmp_keys:
+    rel = k[len(tmp_prefix):]  # preserve relative structure
+    target_key = dst_prefix_final + rel
+    s3.copy_object(
+        Bucket=dst_bucket,
+        Key=target_key,
+        CopySource={"Bucket": tmp_bucket, "Key": k}
+    )
+
+# Cleanup TEMP
+s3_delete_prefix(tmp_bucket, tmp_prefix)
+
+print("Compaction complete and published to final destination.")
+job.commit()
+
