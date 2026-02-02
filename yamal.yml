@@ -349,39 +349,64 @@ job.commit()
 
 
 flowchart LR
+  %% =======================
+  %% HUB (shared services)
+  %% =======================
   subgraph HUB["Connectivity / Hub Subscription"]
-    VWAN["vWAN Hub"]
-    DNS["Private DNS Zones + DNS Resolver"]
+    vwan["vWAN Hub (Connectivity)"]
+    dns["Private DNS Zones + DNS Resolver\n(shared / central)"]
   end
 
+  %% =======================
+  %% DATA PLATFORM SPOKE
+  %% =======================
   subgraph DP["Data Platform Subscription (Spoke)"]
-    DPVNET["Landing Zone VNet"]
-    DPCORE["Core RG: KV + Monitoring"]
-    FAB["Microsoft Fabric Workspaces/Capacity (SaaS)"]
-    DPVNET --- DPCORE
-    DPVNET --- FAB
+    dpvnet["Landing Zone VNet\n(min subnets + PE subnet if needed)"]
+    dpcore["Core RG:\nKey Vault + Monitoring\n(+ optional Storage)"]
+    cap["Fabric Capacity (Azure resource)"]
   end
 
+  fabric["Microsoft Fabric (SaaS)\nWorkspaces / OneLake"]
+
+  %% =======================
+  %% DATA SCIENCE SPOKE
+  %% =======================
   subgraph DS["Data Science Subscription (Spoke)"]
-    DSVNET["Landing Zone VNet"]
-    DSCORE["Core RG: KV + Monitoring + PE Subnet"]
-    AMLPE["Private Endpoint(s) to Azure ML Workspace"]
-    DSVNET --- DSCORE
-    DSVNET --- AMLPE
+    dsvnet["Landing Zone VNet\n(workload subnet + PE subnet)"]
+    pesub["Private Endpoint Subnet"]
+    dscore["Core RG:\nKey Vault + Storage + ACR\n+ Monitoring"]
+    amlws["Azure ML Workspace (control plane)"]
 
-    subgraph AML["Azure ML Workspace"]
-      MNET["Microsoft Managed VNet"]
-      COMP["Training + Batch/Online Compute"]
-      MNET --- COMP
+    subgraph AML["Azure ML - Managed Network Isolation"]
+      mnet["Microsoft Managed VNet"]
+      compute["Training + Batch/Online Compute"]
     end
-
-    AMLPE --> AML
   end
 
-  VWAN --- DPVNET
-  VWAN --- DSVNET
-  DNS -. private dns links .- DPVNET
-  DNS -. private dns links .- DSVNET
+  %% =======================
+  %% HUB-AND-SPOKE LINKS (what they pointed at)
+  %% =======================
+  vwan ---|"vHub connection / VNet peering"| dpvnet
+  vwan ---|"vHub connection / VNet peering"| dsvnet
 
-  COMP -->|AAD Auth + Network path| FAB
-  COMP -.->|Requires CA Exception or Design Change| FAB
+  dns -. "Private DNS VNet links" .-> dpvnet
+  dns -. "Private DNS VNet links" .-> dsvnet
+
+  %% =======================
+  %% DS internal wiring
+  %% =======================
+  dsvnet --> pesub
+  dscore --- amlws
+  pesub -->|"Private Endpoint(s)"| amlws
+  mnet --> compute
+  compute -->|"Private access via PE + DNS"| dscore
+
+  %% =======================
+  %% Fabric relationship
+  %% =======================
+  cap --> fabric
+  compute -. "HTTPS to OneLake/Fabric\n(Controlled by Entra + Fabric CA)" .-> fabric
+
+  note["Open item (BIGGEST RISK):\nHow will Fabric Conditional Access treat traffic from AML Managed VNet?\nOption A: CA exception to allow AML Managed VNet.\nOption B (fallback): move to Customer VNet injection\n(and route via hub controls/firewall)."]
+  note --- fabric
+  note --- mnet
