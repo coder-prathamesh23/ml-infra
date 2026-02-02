@@ -353,7 +353,7 @@ flowchart LR
   %% HUB (shared services)
   %% =======================
   subgraph HUB["Connectivity / Hub Subscription"]
-    vwan["vWAN Hub (Connectivity)"]
+    hubvnet["Hub VNet (Connectivity)"]
     dns["Private DNS Zones + DNS Resolver\n(shared / central)"]
   end
 
@@ -386,8 +386,8 @@ flowchart LR
   %% =======================
   %% HUB-AND-SPOKE LINKS (what they pointed at)
   %% =======================
-  vwan ---|"vHub connection / VNet peering"| dpvnet
-  vwan ---|"vHub connection / VNet peering"| dsvnet
+  hubvnet ---|"VNet peering"| dpvnet
+  hubvnet ---|"VNet peering"| dsvnet
 
   dns -. "Private DNS VNet links" .-> dpvnet
   dns -. "Private DNS VNet links" .-> dsvnet
@@ -399,14 +399,13 @@ flowchart LR
   dscore --- amlws
   pesub -->|"Private Endpoint(s)"| amlws
   mnet --> compute
-  compute -->|"Private access via PE + DNS"| dscore
 
   %% =======================
   %% Fabric relationship
   %% =======================
   cap --> fabric
-  compute -. "HTTPS to OneLake/Fabric\n(Controlled by Entra + Fabric CA)" .-> fabric
+  compute -. "HTTPS to OneLake/Fabric\n(Controlled by Entra ID + Fabric Conditional Access)" .-> fabric
 
-  note["Open item (BIGGEST RISK):\nHow will Fabric Conditional Access treat traffic from AML Managed VNet?\nOption A: CA exception to allow AML Managed VNet.\nOption B (fallback): move to Customer VNet injection\n(and route via hub controls/firewall)."]
+  note["Open item (BIGGEST RISK):\nHow will Fabric Conditional Access treat traffic from AML Managed VNet?\nOption A: Conditional Access exception to allow AML Managed VNet.\nOption B (fallback): move to Customer VNet injection."]
   note --- fabric
   note --- mnet
