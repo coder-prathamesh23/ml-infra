@@ -1,411 +1,206 @@
-# azure-pipelines-sagemaker-docker.yml
-trigger: none
+# ==========================================
+# VALIDATE MANIFEST - shared-app-insights
+# ==========================================
+- stage: ValidateManifest
+  displayName: 'VALIDATE shared-app-insights manifest'
+  dependsOn: []
+  condition: eq('${{ parameters.runMode }}', 'validate-manifest')
 
-pool:
-  name: dataengineering_tf        # your self-hosted agent pool
-
-variables:
-- group:        # variable group with your AWS creds
-
-# Expected variables in tf-sagemaker-dev:
-#   AWS_ACCOUNT_ID        = <12-digit ECR account ID>  (the 3... account)
-#   AWS_REGION            = us-west-2
-#   AWS_ACCESS_KEY_ID     = <access key for 3... account>
-#   AWS_SECRET_ACCESS_KEY = <secret key for 3... account>
-#   AWS_SESSION_TOKEN     = <optional, if using STS; otherwise empty>
-
-stages:
-- stage: RunSageMakerPipeline
-  displayName: "Run SageMaker Pipeline via Docker (legacy AWS CLI)"
   jobs:
-  - job: RunPipeline
-    displayName: "Run pipeline inside ECR-based container"
+  - job: validate_manifest
+    displayName: 'Validate shared-app-insights manifest and state'
     steps:
-
-    # Step 0: Checkout repo (latest DS code)
     - checkout: self
-      displayName: "Checkout repo (latest DS code)"
 
-    # Step 1: Debug – prove which AWS account we are using
-    - script: |
-        echo "=== DEBUG: AWS identity from pipeline (should be ECR account) ==="
-        echo "AWS_REGION      = $(AWS_REGION)"
-        echo "AWS_ACCOUNT_ID  = $(AWS_ACCOUNT_ID)"
+    - template: templates/ensure-az-cli.yml
 
-        echo
-        echo "-> sts get-caller-identity"
-        aws sts get-caller-identity --region $(AWS_REGION)
-      displayName: "DEBUG – who am I (should be ECR account)"
+    - template: templates/bootstrap-terraform.yml
+      parameters:
+        tfVersion: ${{ variables.TF_VERSION }}
+        skipIfPresent: true
+
+    - task: Bash@3
+      name: ProbeSeedRun
+      displayName: 'Probe for prior shared-app-insights tfstate artifact'
       env:
-        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-        AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
-        AWS_REGION: $(AWS_REGION)
-        AWS_DEFAULT_REGION: $(AWS_REGION)
-
-    # Step 2: (optional but useful) check that we can see the repo & images
-    - script: |
-        echo "=== DEBUG: ECR visibility from pipeline ==="
-
-        echo "-> describe-repositories early-crew-dispatch-base"
-        aws ecr describe-repositories \
-          --repository-names early-crew-dispatch-base \
-          --region $(AWS_REGION)
-
-        echo
-        echo "-> describe-images early-crew-dispatch-base"
-        aws ecr describe-images \
-          --repository-name early-crew-dispatch-base \
-          --region $(AWS_REGION)
-      displayName: "DEBUG – can I see the ECR repo & images?"
-      env:
-        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-        AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
-        AWS_REGION: $(AWS_REGION)
-        AWS_DEFAULT_REGION: $(AWS_REGION)
-
-    # Step 3: Login to ECR using legacy aws ecr get-login and pull the image
-    - script: |
-        set -e
-
-        echo "Logging in to ECR using legacy aws ecr get-login..."
-
-        # 1) Call the old CLI command (supported by your AWS CLI)
-        LOGIN_CMD=$(aws ecr get-login --no-include-email --region $(AWS_REGION))
-
-        echo "aws ecr get-login returned:"
-        echo "$LOGIN_CMD"
-
-        if [ -z "$LOGIN_CMD" ]; then
-          echo "ERROR: aws ecr get-login returned empty output"
-          exit 1
-        fi
-
-        # 2) Extract the password that appears after -p / --password
-        PASSWORD=$(echo "$LOGIN_CMD" | awk '{for (i=1;i<=NF;i++) if ($i=="-p" || $i=="--password") {print $(i+1); exit}}')
-
-        if [ -z "$PASSWORD" ]; then
-          echo "ERROR: Could not extract password from aws ecr get-login output"
-          exit 1
-        fi
-
-        # 3) Non-interactive Docker login using password-stdin
-        echo "$PASSWORD" | docker login --username AWS --password-stdin \
-          $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com
-
-        echo "Pulling image with dependencies..."
-        docker pull $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/early-crew-dispatch-base:latest
-      displayName: "Login to ECR and pull base image (legacy CLI)"
-      env:
-        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-        AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
-        AWS_REGION: $(AWS_REGION)
-        AWS_DEFAULT_REGION: $(AWS_REGION)
-
-    # Step 4: Run container, mount repo, execute run_pipeline.py inside it
-    # Step 4: Run container, mount repo, execute run_pipeline.py inside it
-    - script: |
-        set -e
-
-        echo "Running SageMaker pipeline inside container..."
-
-        WORKSPACE="$(System.DefaultWorkingDirectory)"
-
-        echo "Base identity before assume-role (should be IAM user):"
-        aws sts get-caller-identity
-
-        echo ""
-        echo "Assuming SageMaker execution role: $SAGEMAKER_EXECUTION_ROLE_ARN"
-
-        # Call STS to assume the SageMaker execution role
-        CREDS=$(aws sts assume-role \
-          --role-arn "$SAGEMAKER_EXECUTION_ROLE_ARN" \
-          --role-session-name azdo-sagemaker-pipeline \
-          --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
-          --output text)
-
-        # CREDS is: "AKIA... SECRET... TOKEN..."
-        read ROLE_AK ROLE_SK ROLE_TOKEN <<< "$CREDS"
-
-        export ROLE_AWS_ACCESS_KEY_ID="$ROLE_AK"
-        export ROLE_AWS_SECRET_ACCESS_KEY="$ROLE_SK"
-        export ROLE_AWS_SESSION_TOKEN="$ROLE_TOKEN"
-
-        echo ""
-        echo "Identity after assume-role (should be assumed-role/SageMaker-ExecutionRole-Admin/...):"
-        AWS_ACCESS_KEY_ID=$ROLE_AWS_ACCESS_KEY_ID \
-        AWS_SECRET_ACCESS_KEY=$ROLE_AWS_SECRET_ACCESS_KEY \
-        AWS_SESSION_TOKEN=$ROLE_AWS_SESSION_TOKEN \
-          aws sts get-caller-identity
-
-        echo ""
-        echo "Starting Docker container with assumed-role credentials..."
-
-        docker run --rm \
-          -e AWS_ACCESS_KEY_ID=$ROLE_AWS_ACCESS_KEY_ID \
-          -e AWS_SECRET_ACCESS_KEY=$ROLE_AWS_SECRET_ACCESS_KEY \
-          -e AWS_SESSION_TOKEN=$ROLE_AWS_SESSION_TOKEN \
-          -e AWS_REGION=$(AWS_REGION) \
-          -e AWS_DEFAULT_REGION=$(AWS_REGION) \
-          -e OPENBLAS_NUM_THREADS=1 \
-          -e OMP_NUM_THREADS=1 \
-          -e MKL_NUM_THREADS=1 \
-          -e NUMEXPR_NUM_THREADS=1 \
-          -e PYTHONPATH=/workspace/early_crew_dispatch \
-          -v "$WORKSPACE":/workspace \
-          -w /workspace/early_crew_dispatch/ml_pipeline \
-          $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/early-crew-dispatch-base:latest \
-          python ../run_pipeline.py
-      displayName: "Mount repo & run run_pipeline.py in container"
-      env:
-        # IAM user credentials – used only to call sts:AssumeRole
-        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-        AWS_REGION: $(AWS_REGION)
-        AWS_DEFAULT_REGION: $(AWS_REGION)
-        # Execution role to assume
-        SAGEMAKER_EXECUTION_ROLE_ARN: $(SAGEMAKER_EXECUTION_ROLE_ARN)
-
-
-import sys
-import boto3
-from urllib.parse import urlparse
-
-from awsglue.utils import getResolvedOptions
-from pyspark.context import SparkContext
-from awsglue.context import GlueContext
-from awsglue.job import Job
-
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def s3_parse(s3_uri: str):
-    u = urlparse(s3_uri)
-    if u.scheme != "s3":
-        raise ValueError(f"Expected s3:// URI, got: {s3_uri}")
-    bucket = u.netloc
-    key = u.path.lstrip("/")
-    return bucket, key
-
-
-def s3_list_keys(bucket: str, prefix: str):
-    s3 = boto3.client("s3")
-    keys = []
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            keys.append(obj["Key"])
-    return keys
-
-
-def s3_has_parquet(bucket: str, prefix: str) -> bool:
-    s3 = boto3.client("s3")
-    resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=50)
-    for obj in resp.get("Contents", []):
-        if obj["Key"].endswith(".parquet"):
-            return True
-    return False
-
-
-def s3_delete_prefix(bucket: str, prefix: str):
-    s3 = boto3.client("s3")
-    keys = s3_list_keys(bucket, prefix)
-    if not keys:
-        return
-    for i in range(0, len(keys), 1000):
-        chunk = keys[i:i + 1000]
-        s3.delete_objects(
-            Bucket=bucket,
-            Delete={"Objects": [{"Key": k} for k in chunk]}
-        )
-
-
-def get_arg(argv, name, default=None):
-    flag = f"--{name}"
-    if flag in argv:
-        i = argv.index(flag)
-        if i + 1 < len(argv):
-            return argv[i + 1]
-    return default
-
-
-# -----------------------------
-# Required args
-# -----------------------------
-# Required:
-# --JOB_NAME
-# --src_base (s3://bucket/prefix/)
-# --dst_base (s3://bucket/prefix/)
-# --year --month --day
-req = ["JOB_NAME", "src_base", "dst_base", "year", "month", "day"]
-args = getResolvedOptions(sys.argv, req)
-
-# Optional:
-# --hour (e.g. 2)
-# --output_files (default 8; set 1 if you truly want single file output)
-hour = get_arg(sys.argv, "hour", None)
-output_files = int(get_arg(sys.argv, "output_files", "8"))
-
-src_base = args["src_base"].rstrip("/") + "/"
-dst_base = args["dst_base"].rstrip("/") + "/"
-
-# Numeric partition layout: YYYY/M/D/(H/)
-y = str(int(args["year"]))
-m = str(int(args["month"]))
-d = str(int(args["day"]))
-
-partition_path = f"{y}/{m}/{d}/"
-if hour is not None:
-    partition_path += f"{int(hour)}/"  # e.g. "2/"
-
-src_path = src_base + partition_path
-dst_final = dst_base + partition_path
-dst_tmp = dst_base + "_tmp/" + partition_path  # staging publish path
-
-print("========== COMPACTION INPUTS ==========")
-print(f"src_path     = {src_path}")
-print(f"dst_tmp      = {dst_tmp}")
-print(f"dst_final    = {dst_final}")
-print(f"output_files = {output_files}")
-print("=======================================")
-
-# Validate input exists (parquet files)
-src_bucket, src_prefix = s3_parse(src_path)
-if not s3_has_parquet(src_bucket, src_prefix):
-    print(f"No parquet found under {src_path}. Exiting without changes.")
-    sys.exit(0)
-
-# -----------------------------
-# Spark/Glue init
-# -----------------------------
-sc = SparkContext()
-glueContext = GlueContext(sc)
-spark = glueContext.spark_session
-
-job = Job(glueContext)
-job.init(args["JOB_NAME"], args)
-
-# Reasonable defaults
-spark.conf.set("spark.sql.parquet.mergeSchema", "false")
-spark.conf.set("spark.sql.files.ignoreCorruptFiles", "true")
-spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
-
-# -----------------------------
-# Read raw parquet
-# -----------------------------
-df = spark.read.parquet(src_path)
-
-# -----------------------------
-# Reduce output file count
-# -----------------------------
-# coalesce reduces partitions without full shuffle; good for compaction output
-current_parts = df.rdd.getNumPartitions()
-if output_files <= 0:
-    raise ValueError("output_files must be >= 1")
-
-if output_files < current_parts:
-    df_out = df.coalesce(output_files)
-elif output_files > current_parts:
-    df_out = df.repartition(output_files)
-else:
-    df_out = df
-
-# -----------------------------
-# Write to TEMP
-# -----------------------------
-# Overwrite temp partition path so reruns are clean
-df_out.write.mode("overwrite").parquet(dst_tmp)
-
-# -----------------------------
-# Publish (TEMP -> FINAL)
-# -----------------------------
-dst_bucket, dst_prefix_final = s3_parse(dst_final)
-tmp_bucket, tmp_prefix = s3_parse(dst_tmp)
-
-s3 = boto3.client("s3")
-
-# Delete existing FINAL partition
-s3_delete_prefix(dst_bucket, dst_prefix_final)
-
-# Copy objects from TEMP -> FINAL
-tmp_keys = s3_list_keys(tmp_bucket, tmp_prefix)
-for k in tmp_keys:
-    rel = k[len(tmp_prefix):]  # preserve relative structure
-    target_key = dst_prefix_final + rel
-    s3.copy_object(
-        Bucket=dst_bucket,
-        Key=target_key,
-        CopySource={"Bucket": tmp_bucket, "Key": k}
-    )
-
-# Cleanup TEMP
-s3_delete_prefix(tmp_bucket, tmp_prefix)
-
-print("Compaction complete and published to final destination.")
-job.commit()
-
-
-flowchart LR
-  %% =======================
-  %% HUB (shared services)
-  %% =======================
-  subgraph HUB["Connectivity / Hub Subscription"]
-    hubvnet["Hub VNet (Connectivity)"]
-    dns["Private DNS Zones + DNS Resolver\n(shared / central)"]
-  end
-
-  %% =======================
-  %% DATA PLATFORM SPOKE
-  %% =======================
-  subgraph DP["Data Platform Subscription (Spoke)"]
-    dpvnet["Landing Zone VNet\n(min subnets + PE subnet if needed)"]
-    dpcore["Core RG:\nKey Vault + Monitoring\n(+ optional Storage)"]
-    cap["Fabric Capacity (Azure resource)"]
-  end
-
-  fabric["Microsoft Fabric (SaaS)\nWorkspaces / OneLake"]
-
-  %% =======================
-  %% DATA SCIENCE SPOKE
-  %% =======================
-  subgraph DS["Data Science Subscription (Spoke)"]
-    dsvnet["Landing Zone VNet\n(workload subnet + PE subnet)"]
-    pesub["Private Endpoint Subnet"]
-    dscore["Core RG:\nKey Vault + Storage + ACR\n+ Monitoring"]
-    amlws["Azure ML Workspace (control plane)"]
-
-    subgraph AML["Azure ML - Managed Network Isolation"]
-      mnet["Microsoft Managed VNet"]
-      compute["Training + Batch/Online Compute"]
-    end
-  end
-
-  %% =======================
-  %% HUB-AND-SPOKE LINKS (what they pointed at)
-  %% =======================
-  hubvnet ---|"VNet peering"| dpvnet
-  hubvnet ---|"VNet peering"| dsvnet
-
-  dns -. "Private DNS VNet links" .-> dpvnet
-  dns -. "Private DNS VNet links" .-> dsvnet
-
-  %% =======================
-  %% DS internal wiring
-  %% =======================
-  dsvnet --> pesub
-  dscore --- amlws
-  pesub -->|"Private Endpoint(s)"| amlws
-  mnet --> compute
-
-  %% =======================
-  %% Fabric relationship
-  %% =======================
-  cap --> fabric
-  compute -. "HTTPS to OneLake/Fabric\n(Controlled by Entra ID + Fabric Conditional Access)" .-> fabric
-
-  note["Open item (BIGGEST RISK):\nHow will Fabric Conditional Access treat traffic from AML Managed VNet?\nOption A: Conditional Access exception to allow AML Managed VNet.\nOption B (fallback): move to Customer VNet injection."]
-  note --- fabric
-  note --- mnet
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+
+          ORG_URL="$(System.CollectionUri)"
+          PROJECT="$(System.TeamProject)"
+          DEF_ID="$(System.DefinitionId)"
+          BRANCH="$(Build.SourceBranch)"
+          ARTIFACT_NAME="$(TFSTATE_ARTIFACT_NAME)"
+          CURRENT_BUILD_ID="$(Build.BuildId)"
+
+          echo "Looking for latest successful run with artifact: $ARTIFACT_NAME"
+
+          command -v jq >/dev/null 2>&1 || { echo "ERROR: jq missing"; exit 1; }
+
+          BUILDS_JSON=$(curl -sS \
+            -H "Authorization: Bearer ${SYSTEM_ACCESSTOKEN}" \
+            "${ORG_URL}${PROJECT}/_apis/build/builds?definitions=${DEF_ID}&branchName=${BRANCH}&resultFilter=succeeded&queryOrder=finishTimeDescending&%24top=50&api-version=7.1-preview.7")
+
+          BUILD_IDS=$(echo "$BUILDS_JSON" | jq -r '.value[].id')
+          SEED_RUN_ID="none"
+
+          for BID in $BUILD_IDS; do
+            if [ "$BID" = "$CURRENT_BUILD_ID" ]; then
+              continue
+            fi
+
+            ART_JSON=$(curl -sS \
+              -H "Authorization: Bearer ${SYSTEM_ACCESSTOKEN}" \
+              "${ORG_URL}${PROJECT}/_apis/build/builds/${BID}/artifacts?api-version=7.1-preview.5")
+
+            MATCH=$(echo "$ART_JSON" | jq -r --arg N "$ARTIFACT_NAME" '.value[]?.name | select(.==$N)' | head -n1 || true)
+
+            if [ -n "$MATCH" ]; then
+              echo "Found state artifact in run: $BID"
+              SEED_RUN_ID="$BID"
+              break
+            fi
+          done
+
+          echo "SeedRunId: $SEED_RUN_ID"
+          echo "##vso[task.setvariable variable=SeedRunId]$SEED_RUN_ID"
+
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Restore previous shared-app-insights state artifact'
+      condition: and(succeeded(), ne(variables.SeedRunId, 'none'))
+      inputs:
+        buildType: 'specific'
+        project: '$(System.TeamProject)'
+        definition: '$(System.DefinitionId)'
+        buildVersionToDownload: 'specific'
+        pipelineId: '$(SeedRunId)'
+        artifactName: '$(TFSTATE_ARTIFACT_NAME)'
+        targetPath: '$(System.DefaultWorkingDirectory)/$(STATE_DIR)'
+      continueOnError: true
+
+    - task: AzureCLI@2
+      displayName: 'Validate manifest resources and state presence'
+      inputs:
+        azureSubscription: $(AZ_SC_APPLY)
+        scriptType: bash
+        scriptLocation: inlineScript
+        workingDirectory: $(System.DefaultWorkingDirectory)
+        inlineScript: |
+          set -euo pipefail
+
+          OUTDIR="$(Build.ArtifactStagingDirectory)/validated-manifest"
+          REPO_ROOT="$(System.DefaultWorkingDirectory)"
+          MANIFEST="$REPO_ROOT/$(RECONCILIATION_DIR)/import-manifest.csv"
+
+          mkdir -p "$OUTDIR"
+
+          command -v az >/dev/null 2>&1 || { echo "ERROR: AZ CLI missing"; exit 1; }
+          command -v terraform >/dev/null 2>&1 || { echo "ERROR: Terraform missing"; exit 1; }
+
+          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+          export ARM_TENANT_ID="$(az account show --query tenantId -o tsv)"
+          export ARM_USE_OIDC=true
+          export ARM_CLIENT_ID="$(az account show --query user.name -o tsv)"
+          export TF_IN_AUTOMATION=1
+
+          echo "Azure account context:"
+          az account show -o table | tee "$OUTDIR/az_account_context.txt"
+
+          if [ ! -f "$MANIFEST" ]; then
+            echo "ERROR: Manifest not found: $MANIFEST"
+            exit 1
+          fi
+
+          echo "Manifest content:"
+          nl -ba "$MANIFEST" | tee "$OUTDIR/manifest_content.txt"
+
+          if [ ! -d "$(TF_DIR)" ]; then
+            echo "ERROR: Terraform folder not found: $(TF_DIR)"
+            exit 1
+          fi
+
+          mkdir -p "$(STATE_DIR)" "$(TF_DIR)"
+
+          if [ -f "$(STATE_DIR)/terraform.tfstate" ]; then
+            cp "$(STATE_DIR)/terraform.tfstate" "$(TF_DIR)/terraform.tfstate"
+          fi
+
+          if [ -f "$(STATE_DIR)/terraform.tfstate.backup" ]; then
+            cp "$(STATE_DIR)/terraform.tfstate.backup" "$(TF_DIR)/terraform.tfstate.backup"
+          fi
+
+          ROWS_FILE="$OUTDIR/manifest_rows.tsv"
+          rm -f "$ROWS_FILE"
+
+          awk -F',' '
+            NR > 1 {
+              gsub(/\r/, "", $0)
+              if ($2 != "" && $4 != "") {
+                print $2 "\t" $4
+              }
+            }
+          ' "$MANIFEST" > "$ROWS_FILE"
+
+          echo "Parsed manifest rows:"
+          cat "$ROWS_FILE" | tee "$OUTDIR/parsed_manifest_rows.txt"
+
+          if [ ! -s "$ROWS_FILE" ]; then
+            echo "ERROR: No valid manifest rows found."
+            exit 2
+          fi
+
+          echo "Validating Azure resource IDs from manifest..."
+
+          while IFS=$'\t' read -r TF_ADDRESS RESOURCE_ID
+          do
+            echo "--------------------------------------------------"
+            echo "Terraform address: $TF_ADDRESS"
+            echo "Azure resource ID: $RESOURCE_ID"
+
+            SAFE_NAME=$(echo "$TF_ADDRESS" | tr '.[]/' '____')
+
+            az resource show \
+              --ids "$RESOURCE_ID" \
+              -o json > "$OUTDIR/${SAFE_NAME}.resource.json"
+
+            echo "AZURE_EXISTS: $TF_ADDRESS"
+          done < "$ROWS_FILE"
+
+          cd "$(TF_DIR)"
+
+          mkdir -p .backend_disabled
+          for f in $(grep -rl 'backend *"azurerm"' . || true); do
+            mv "$f" ".backend_disabled/$(basename "$f")"
+          done
+
+          terraform init -backend=false -input=false 2>&1 | tee "$OUTDIR/terraform_init.txt"
+
+          echo "Current Terraform state list:"
+          terraform state list 2>/dev/null | tee "$OUTDIR/terraform_state_list.txt" || true
+
+          STATE_CHECK_FILE="$OUTDIR/state_check_summary.tsv"
+          echo -e "tf_address\tazure_exists\tstate_status\tnext_action" > "$STATE_CHECK_FILE"
+
+          while IFS=$'\t' read -r TF_ADDRESS RESOURCE_ID
+          do
+            if terraform state list 2>/dev/null | grep -Fxq "$TF_ADDRESS"; then
+              echo "IN_STATE: $TF_ADDRESS"
+              echo -e "$TF_ADDRESS\ttrue\tIN_STATE\tSKIP_IMPORT" >> "$STATE_CHECK_FILE"
+            else
+              echo "NOT_IN_STATE: $TF_ADDRESS"
+              echo -e "$TF_ADDRESS\ttrue\tNOT_IN_STATE\tPROCEED_TO_IMPORT_PLAN" >> "$STATE_CHECK_FILE"
+            fi
+          done < "$ROWS_FILE"
+
+          echo "State check summary:"
+          cat "$STATE_CHECK_FILE"
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish shared-app-insights validation output'
+      condition: always()
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/validated-manifest'
+        artifact: 'shared-app-insights-validated-manifest'
