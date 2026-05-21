@@ -1,14 +1,14 @@
 # ==========================================
-# VALIDATE MANIFEST - shared-app-insights
+# IMPORT PLAN - shared-app-insights
 # ==========================================
-- stage: ValidateManifest
-  displayName: 'VALIDATE shared-app-insights manifest'
+- stage: ImportPlan
+  displayName: 'IMPORT PLAN - shared-app-insights'
   dependsOn: []
-  condition: eq('${{ parameters.runMode }}', 'validate-manifest')
+  condition: eq('${{ parameters.runMode }}', 'import-plan')
 
   jobs:
-  - job: validate_manifest
-    displayName: 'Validate shared-app-insights manifest and state'
+  - job: import_plan
+    displayName: 'Terraform import plan - shared-app-insights'
     steps:
     - checkout: self
 
@@ -82,7 +82,7 @@
       continueOnError: true
 
     - task: AzureCLI@2
-      displayName: 'Validate manifest resources and state presence'
+      displayName: 'Terraform import plan - shared-app-insights'
       inputs:
         azureSubscription: $(AZ_SC_APPLY)
         scriptType: bash
@@ -91,7 +91,7 @@
         inlineScript: |
           set -euo pipefail
 
-          OUTDIR="$(Build.ArtifactStagingDirectory)/validated-manifest"
+          OUTDIR="$(Build.ArtifactStagingDirectory)/import-plan"
           REPO_ROOT="$(System.DefaultWorkingDirectory)"
           MANIFEST="$REPO_ROOT/$(RECONCILIATION_DIR)/import-manifest.csv"
 
@@ -106,19 +106,8 @@
           export ARM_CLIENT_ID="$(az account show --query user.name -o tsv)"
           export TF_IN_AUTOMATION=1
 
-          echo "Azure account context:"
-          az account show -o table | tee "$OUTDIR/az_account_context.txt"
-
           if [ ! -f "$MANIFEST" ]; then
             echo "ERROR: Manifest not found: $MANIFEST"
-            exit 1
-          fi
-
-          echo "Manifest content:"
-          nl -ba "$MANIFEST" | tee "$OUTDIR/manifest_content.txt"
-
-          if [ ! -d "$(TF_DIR)" ]; then
-            echo "ERROR: Terraform folder not found: $(TF_DIR)"
             exit 1
           fi
 
@@ -132,43 +121,6 @@
             cp "$(STATE_DIR)/terraform.tfstate.backup" "$(TF_DIR)/terraform.tfstate.backup"
           fi
 
-          ROWS_FILE="$OUTDIR/manifest_rows.tsv"
-          rm -f "$ROWS_FILE"
-
-          awk -F',' '
-            NR > 1 {
-              gsub(/\r/, "", $0)
-              if ($2 != "" && $4 != "") {
-                print $2 "\t" $4
-              }
-            }
-          ' "$MANIFEST" > "$ROWS_FILE"
-
-          echo "Parsed manifest rows:"
-          cat "$ROWS_FILE" | tee "$OUTDIR/parsed_manifest_rows.txt"
-
-          if [ ! -s "$ROWS_FILE" ]; then
-            echo "ERROR: No valid manifest rows found."
-            exit 2
-          fi
-
-          echo "Validating Azure resource IDs from manifest..."
-
-          while IFS=$'\t' read -r TF_ADDRESS RESOURCE_ID
-          do
-            echo "--------------------------------------------------"
-            echo "Terraform address: $TF_ADDRESS"
-            echo "Azure resource ID: $RESOURCE_ID"
-
-            SAFE_NAME=$(echo "$TF_ADDRESS" | tr '.[]/' '____')
-
-            az resource show \
-              --ids "$RESOURCE_ID" \
-              -o json > "$OUTDIR/${SAFE_NAME}.resource.json"
-
-            echo "AZURE_EXISTS: $TF_ADDRESS"
-          done < "$ROWS_FILE"
-
           cd "$(TF_DIR)"
 
           mkdir -p .backend_disabled
@@ -178,29 +130,245 @@
 
           terraform init -backend=false -input=false 2>&1 | tee "$OUTDIR/terraform_init.txt"
 
-          echo "Current Terraform state list:"
-          terraform state list 2>/dev/null | tee "$OUTDIR/terraform_state_list.txt" || true
+          LAW_NAME_EFFECTIVE="$(LAW_NAME)"
+          if [ -z "$LAW_NAME_EFFECTIVE" ]; then
+            LAW_NAME_EFFECTIVE="$(APPINSIGHTS_NAME)-law"
+          fi
 
-          STATE_CHECK_FILE="$OUTDIR/state_check_summary.tsv"
-          echo -e "tf_address\tazure_exists\tstate_status\tnext_action" > "$STATE_CHECK_FILE"
+          export TF_VAR_name="$(APPINSIGHTS_NAME)"
+          export TF_VAR_location="$(LOCATION)"
+          export TF_VAR_resource_group_name="$(APPINSIGHTS_RG)"
+          export TF_VAR_create_log_analytics_workspace="$(CREATE_LAW)"
+          export TF_VAR_log_analytics_workspace_name="$LAW_NAME_EFFECTIVE"
+          export TF_VAR_log_analytics_retention_in_days="$(LAW_RETENTION_DAYS)"
+          export TF_VAR_log_analytics_workspace_rg="$(LAW_EXISTING_RG)"
 
-          while IFS=$'\t' read -r TF_ADDRESS RESOURCE_ID
-          do
-            if terraform state list 2>/dev/null | grep -Fxq "$TF_ADDRESS"; then
-              echo "IN_STATE: $TF_ADDRESS"
-              echo -e "$TF_ADDRESS\ttrue\tIN_STATE\tSKIP_IMPORT" >> "$STATE_CHECK_FILE"
-            else
-              echo "NOT_IN_STATE: $TF_ADDRESS"
-              echo -e "$TF_ADDRESS\ttrue\tNOT_IN_STATE\tPROCEED_TO_IMPORT_PLAN" >> "$STATE_CHECK_FILE"
-            fi
-          done < "$ROWS_FILE"
+          echo "Final Terraform variables:"
+          echo "TF_VAR_name=$TF_VAR_name"
+          echo "TF_VAR_resource_group_name=$TF_VAR_resource_group_name"
+          echo "TF_VAR_create_log_analytics_workspace=$TF_VAR_create_log_analytics_workspace"
+          echo "TF_VAR_log_analytics_workspace_name=$TF_VAR_log_analytics_workspace_name"
+          echo "TF_VAR_log_analytics_workspace_rg=$TF_VAR_log_analytics_workspace_rg"
 
-          echo "State check summary:"
-          cat "$STATE_CHECK_FILE"
+          echo "Creating import blocks from manifest"
+
+          rm -f imports.auto.tf
+
+          awk -F',' '
+            NR > 1 {
+              gsub(/\r/, "", $0)
+              if ($2 != "" && $4 != "") {
+                print "import {"
+                print "  to = " $2
+                print "  id = \"" $4 "\""
+                print "}"
+                print ""
+              }
+            }
+          ' "$MANIFEST" > imports.auto.tf
+
+          echo "Generated imports.auto.tf:"
+          cat imports.auto.tf | tee "$OUTDIR/imports.auto.tf"
+
+          if ! grep -q '^import {' imports.auto.tf; then
+            echo "ERROR: imports.auto.tf is empty."
+            exit 22
+          fi
+
+          echo "Running Terraform import plan"
+          set +e
+          terraform plan -no-color -input=false -lock=false -out=tfplan 2>&1 | tee "$OUTDIR/terraform_import_plan.txt"
+          PLAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          echo "$PLAN_EXIT" > "$OUTDIR/plan_exit_code.txt"
+          echo "Terraform plan exit code: $PLAN_EXIT"
+
+          if [ "$PLAN_EXIT" -ne 0 ]; then
+            echo "ERROR: terraform import plan failed."
+            exit "$PLAN_EXIT"
+          fi
+
+          echo "Checking import plan for unsafe actions"
+
+          if grep -E "will be created|will be updated in-place|must be replaced|will be destroyed" "$OUTDIR/terraform_import_plan.txt"; then
+            echo "ERROR: Import plan contains create/update/replace/destroy actions. Do not apply."
+            exit 1
+          fi
+
+          if grep -E "Plan: .* [1-9][0-9]* to add|Plan: .* [1-9][0-9]* to change|Plan: .* [1-9][0-9]* to destroy" "$OUTDIR/terraform_import_plan.txt"; then
+            echo "ERROR: Import plan contains add/change/destroy counts. Do not apply."
+            exit 1
+          fi
+
+          if ! grep -q "to import" "$OUTDIR/terraform_import_plan.txt"; then
+            echo "ERROR: No imports detected in import plan."
+            exit 1
+          fi
+
+          echo "Import plan is safe."
+
+          tar czf tfbundle-import.tgz tfplan terraform.tfstate imports.auto.tf
+
+    - publish: '$(System.DefaultWorkingDirectory)/$(TF_DIR)/tfbundle-import.tgz'
+      artifact: '$(IMPORT_PLAN_ARTIFACT_NAME)'
 
     - task: PublishPipelineArtifact@1
-      displayName: 'Publish shared-app-insights validation output'
+      displayName: 'Publish readable import-plan logs'
       condition: always()
       inputs:
-        targetPath: '$(Build.ArtifactStagingDirectory)/validated-manifest'
-        artifact: 'shared-app-insights-validated-manifest'
+        targetPath: '$(Build.ArtifactStagingDirectory)/import-plan'
+        artifact: '$(IMPORT_PLAN_READABLE_ARTIFACT_NAME)'
+
+# ==========================================
+# IMPORT APPLY - shared-app-insights
+# ==========================================
+- stage: ImportApply
+  displayName: 'IMPORT APPLY - shared-app-insights'
+  dependsOn: []
+  condition: eq('${{ parameters.runMode }}', 'import-apply')
+
+  jobs:
+  - job: import_apply
+    displayName: 'Terraform import apply - shared-app-insights'
+    steps:
+    - checkout: self
+
+    - template: templates/ensure-az-cli.yml
+
+    - template: templates/bootstrap-terraform.yml
+      parameters:
+        tfVersion: ${{ variables.TF_VERSION }}
+        skipIfPresent: true
+
+    - task: Bash@3
+      name: ProbeImportPlanRun
+      displayName: 'Probe for prior shared-app-insights import-plan artifact'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        targetType: inline
+        script: |
+          set -euo pipefail
+
+          ORG_URL="$(System.CollectionUri)"
+          PROJECT="$(System.TeamProject)"
+          DEF_ID="$(System.DefinitionId)"
+          BRANCH="$(Build.SourceBranch)"
+          ARTIFACT_NAME="$(IMPORT_PLAN_ARTIFACT_NAME)"
+          CURRENT_BUILD_ID="$(Build.BuildId)"
+
+          echo "Looking for latest successful run with import plan artifact: $ARTIFACT_NAME"
+
+          command -v jq >/dev/null 2>&1 || { echo "ERROR: jq missing"; exit 1; }
+
+          BUILDS_JSON=$(curl -sS \
+            -H "Authorization: Bearer ${SYSTEM_ACCESSTOKEN}" \
+            "${ORG_URL}${PROJECT}/_apis/build/builds?definitions=${DEF_ID}&branchName=${BRANCH}&resultFilter=succeeded&queryOrder=finishTimeDescending&%24top=50&api-version=7.1-preview.7")
+
+          BUILD_IDS=$(echo "$BUILDS_JSON" | jq -r '.value[].id')
+          IMPORT_PLAN_RUN_ID="none"
+
+          for BID in $BUILD_IDS; do
+            if [ "$BID" = "$CURRENT_BUILD_ID" ]; then
+              continue
+            fi
+
+            ART_JSON=$(curl -sS \
+              -H "Authorization: Bearer ${SYSTEM_ACCESSTOKEN}" \
+              "${ORG_URL}${PROJECT}/_apis/build/builds/${BID}/artifacts?api-version=7.1-preview.5")
+
+            MATCH=$(echo "$ART_JSON" | jq -r --arg N "$ARTIFACT_NAME" '.value[]?.name | select(.==$N)' | head -n1 || true)
+
+            if [ -n "$MATCH" ]; then
+              echo "Found import-plan artifact in run: $BID"
+              IMPORT_PLAN_RUN_ID="$BID"
+              break
+            fi
+          done
+
+          if [ "$IMPORT_PLAN_RUN_ID" = "none" ]; then
+            echo "ERROR: No prior successful import-plan artifact found."
+            exit 1
+          fi
+
+          echo "ImportPlanRunId: $IMPORT_PLAN_RUN_ID"
+          echo "##vso[task.setvariable variable=ImportPlanRunId]$IMPORT_PLAN_RUN_ID"
+
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download shared-app-insights import-plan artifact'
+      inputs:
+        buildType: 'specific'
+        project: '$(System.TeamProject)'
+        definition: '$(System.DefinitionId)'
+        buildVersionToDownload: 'specific'
+        pipelineId: '$(ImportPlanRunId)'
+        artifactName: '$(IMPORT_PLAN_ARTIFACT_NAME)'
+        targetPath: '$(Pipeline.Workspace)/$(IMPORT_PLAN_ARTIFACT_NAME)'
+      continueOnError: false
+
+    - task: Bash@3
+      displayName: 'Extract shared-app-insights import-plan bundle'
+      inputs:
+        workingDirectory: $(System.DefaultWorkingDirectory)
+        targetType: inline
+        script: |
+          set -euo pipefail
+
+          if [ ! -f "$(Pipeline.Workspace)/$(IMPORT_PLAN_ARTIFACT_NAME)/tfbundle-import.tgz" ]; then
+            echo "ERROR: tfbundle-import.tgz not found."
+            exit 1
+          fi
+
+          mkdir -p "$(TF_DIR)"
+          tar xzf "$(Pipeline.Workspace)/$(IMPORT_PLAN_ARTIFACT_NAME)/tfbundle-import.tgz" -C "$(TF_DIR)"
+
+          ls -la "$(TF_DIR)"
+
+          if [ ! -f "$(TF_DIR)/tfplan" ]; then
+            echo "ERROR: tfplan not found after extracting bundle."
+            exit 1
+          fi
+
+    - task: AzureCLI@2
+      displayName: 'Terraform apply saved import plan'
+      inputs:
+        azureSubscription: $(AZ_SC_APPLY)
+        scriptType: bash
+        scriptLocation: inlineScript
+        workingDirectory: $(System.DefaultWorkingDirectory)
+        inlineScript: |
+          set -euo pipefail
+
+          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+          export ARM_TENANT_ID="$(az account show --query tenantId -o tsv)"
+          export ARM_USE_OIDC=true
+          export ARM_CLIENT_ID="$(az account show --query user.name -o tsv)"
+          export TF_IN_AUTOMATION=1
+
+          cd "$(TF_DIR)"
+
+          mkdir -p .backend_disabled
+          for f in $(grep -rl 'backend *"azurerm"' . || true); do
+            mv "$f" ".backend_disabled/$(basename "$f")"
+          done
+
+          terraform init -backend=false -input=false
+
+          echo "Applying saved import plan"
+          terraform apply -input=false tfplan
+
+          echo "State after import apply:"
+          terraform state list
+
+          cd ..
+          mkdir -p "$(STATE_DIR)"
+          cp "$(TF_DIR)/terraform.tfstate" "$(STATE_DIR)/terraform.tfstate" || true
+          cp "$(TF_DIR)/terraform.tfstate.backup" "$(STATE_DIR)/terraform.tfstate.backup" || true
+
+    - publish: '$(System.DefaultWorkingDirectory)/$(STATE_DIR)'
+      artifact: '$(TFSTATE_ARTIFACT_NAME)'
+      displayName: 'Publish shared-app-insights statefiles after import'
+      condition: always()
+
+
