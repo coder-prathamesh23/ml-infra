@@ -5,12 +5,12 @@ parameters:
   - name: stackPath
     displayName: Stack path
     type: string
-    default: stacks/addons/azureml-workspace
+    default: stacks/add-ons/azureml-workspace
 
   - name: terraformVersion
     displayName: Terraform version
     type: string
-    default: 1.7.5
+    default: 1.13.3
 
 variables:
   - group: DATA_SCIENCE_LZ_DEV
@@ -29,10 +29,10 @@ pool:
 
 stages:
   - stage: ImportAMLManagedNetworkOutboundRules
-    displayName: Import AML managed network outbound rules
+    displayName: Import AML outbound rules
     jobs:
       - deployment: ImportRules
-        displayName: Import rules into Terraform state
+        displayName: Import or move AML outbound rules in Terraform state
         environment: $(AZDO_ENVIRONMENT)
         strategy:
           runOnce:
@@ -55,7 +55,8 @@ stages:
                     inlineScript: |
                       set -euo pipefail
 
-                      : "${AZURE_SERVICE_CONNECTION:?AZURE_SERVICE_CONNECTION is required}"
+                      echo "Starting AML outbound rules state import/move..."
+
                       : "${TF_BACKEND_RG:?TF_BACKEND_RG is required}"
                       : "${TF_BACKEND_STORAGE:?TF_BACKEND_STORAGE is required}"
                       : "${TF_BACKEND_CONTAINER:?TF_BACKEND_CONTAINER is required}"
@@ -64,11 +65,6 @@ stages:
                       STACK_PATH="${{ parameters.stackPath }}"
                       STACK_PATH="${STACK_PATH#/}"
                       STACK_PATH="${STACK_PATH%/}"
-
-                      if [ -z "$STACK_PATH" ]; then
-                        echo "ERROR: stackPath cannot be empty."
-                        exit 1
-                      fi
 
                       if [ ! -d "$STACK_PATH" ]; then
                         echo "ERROR: stackPath '$STACK_PATH' does not exist."
@@ -82,20 +78,21 @@ stages:
                         exit 1
                       fi
 
-                      KEY_OVERRIDE="${TF_BACKEND_KEY:-}"
-                      if [ -n "$KEY_OVERRIDE" ]; then
-                        key="$KEY_OVERRIDE"
+                      if [ -n "${TF_BACKEND_KEY:-}" ]; then
+                        BACKEND_KEY="$TF_BACKEND_KEY"
                       else
-                        key="$DEPLOY_ENV/$STACK_PATH/terraform.tfstate"
+                        BACKEND_KEY="$DEPLOY_ENV/$STACK_PATH/terraform.tfstate"
                       fi
 
-                      echo "Using backend key: $key"
+                      echo "Using backend key: $BACKEND_KEY"
 
                       ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
-                      ARM_TENANT_ID="$(az account show --query tenantId -o tsv)"
+                      ARM_TENANT_ID="${tenantId:-$(az account show --query tenantId -o tsv)}"
                       ARM_CLIENT_ID="${servicePrincipalId:-}"
 
-                      export ARM_SUBSCRIPTION_ID ARM_TENANT_ID ARM_CLIENT_ID
+                      export ARM_SUBSCRIPTION_ID
+                      export ARM_TENANT_ID
+                      export ARM_CLIENT_ID
                       export ARM_USE_CLI=false
 
                       if [ -n "${servicePrincipalKey:-}" ]; then
@@ -112,24 +109,23 @@ stages:
                         -backend-config="resource_group_name=${TF_BACKEND_RG}" \
                         -backend-config="storage_account_name=${TF_BACKEND_STORAGE}" \
                         -backend-config="container_name=${TF_BACKEND_CONTAINER}" \
-                        -backend-config="key=${key}" \
+                        -backend-config="key=${BACKEND_KEY}" \
                         -backend-config="use_azuread_auth=true"
 
                       terraform validate -no-color
 
                       if [ -n "${AML_WORKSPACE_ID:-}" ]; then
-                        workspace_id="$AML_WORKSPACE_ID"
+                        WORKSPACE_ID="$AML_WORKSPACE_ID"
                       else
                         : "${AML_WORKSPACE_RG:?AML_WORKSPACE_RG is required when AML_WORKSPACE_ID is not set}"
                         : "${AML_WORKSPACE_NAME:?AML_WORKSPACE_NAME is required when AML_WORKSPACE_ID is not set}"
 
-                        workspace_id="/subscriptions/${ARM_SUBSCRIPTION_ID}/resourceGroups/${AML_WORKSPACE_RG}/providers/Microsoft.MachineLearningServices/workspaces/${AML_WORKSPACE_NAME}"
+                        WORKSPACE_ID="/subscriptions/${ARM_SUBSCRIPTION_ID}/resourceGroups/${AML_WORKSPACE_RG}/providers/Microsoft.MachineLearningServices/workspaces/${AML_WORKSPACE_NAME}"
                       fi
 
-                      echo "Using AML workspace ID: $workspace_id"
+                      echo "Using AML workspace ID: $WORKSPACE_ID"
 
-                      RULE_NAMES=(
-                        "FoundryEndpoint"
+                      FQDN_RULE_NAMES=(
                         "FabricEndpoint"
                         "Onelake-Endpoint"
                         "Python-Package-Index"
@@ -143,44 +139,79 @@ stages:
                         "Python"
                         "Python-Files"
                         "Terraform-Registry"
-                        "Central-Foundry-Endpoint"
-                        "Central-Registry-Endpoint"
                         "DevOps"
                       )
 
-                      for rule_name in "${RULE_NAMES[@]}"; do
-                        tf_addr="module.azureml_workspace.azapi_resource.managed_network_outbound_rule[\"${rule_name}\"]"
-                        rule_id="${workspace_id}/managedNetworks/default/outboundRules/${rule_name}"
+                      PRIVATE_ENDPOINT_RULE_NAMES=(
+                        "FoundryEndpoint"
+                        "Central-Foundry-Endpoint"
+                        "Central-Registry-Endpoint"
+                      )
+
+                      move_or_import_rule() {
+                        local rule_name="$1"
+                        local old_addr="$2"
+                        local new_addr="$3"
+                        local rule_id="$4"
 
                         echo "------------------------------------------------------------"
                         echo "Rule: $rule_name"
-                        echo "Terraform address: $tf_addr"
+                        echo "Old address: $old_addr"
+                        echo "New address: $new_addr"
                         echo "Azure resource ID: $rule_id"
 
-                        if terraform state show "$tf_addr" >/dev/null 2>&1; then
-                          echo "Already imported. Skipping: $rule_name"
+                        if terraform state show "$new_addr" >/dev/null 2>&1; then
+                          echo "Already present at new address. Skipping: $rule_name"
+
+                        elif terraform state show "$old_addr" >/dev/null 2>&1; then
+                          echo "Old address found. Moving state only: $rule_name"
+                          terraform state mv "$old_addr" "$new_addr"
+
                         else
-                          terraform import -no-color -var-file="terraform.tfvars" "$tf_addr" "$rule_id"
+                          echo "State not found. Importing existing Azure rule: $rule_name"
+                          terraform import -no-color -var-file="terraform.tfvars" "$new_addr" "$rule_id"
                         fi
+                      }
+
+                      echo "Processing FQDN outbound rules..."
+
+                      for rule_name in "${FQDN_RULE_NAMES[@]}"; do
+                        old_addr="module.azureml_workspace.azapi_resource.managed_network_outbound_rule[\"${rule_name}\"]"
+                        new_addr="module.azureml_workspace.azapi_resource.managed_network_outbound_fqdn_rule[\"${rule_name}\"]"
+                        rule_id="${WORKSPACE_ID}/managedNetworks/default/outboundRules/${rule_name}"
+
+                        move_or_import_rule "$rule_name" "$old_addr" "$new_addr" "$rule_id"
+                      done
+
+                      echo "Processing PrivateEndpoint outbound rules..."
+
+                      for rule_name in "${PRIVATE_ENDPOINT_RULE_NAMES[@]}"; do
+                        old_addr="module.azureml_workspace.azapi_resource.managed_network_outbound_rule[\"${rule_name}\"]"
+                        new_addr="module.azureml_workspace.azapi_resource.managed_network_outbound_private_endpoint_rule[\"${rule_name}\"]"
+                        rule_id="${WORKSPACE_ID}/managedNetworks/default/outboundRules/${rule_name}"
+
+                        move_or_import_rule "$rule_name" "$old_addr" "$new_addr" "$rule_id"
                       done
 
                       echo "------------------------------------------------------------"
-                      echo "Imported managed_network_outbound_rule resources:"
-                      terraform state list | grep 'managed_network_outbound_rule' || true
+                      echo "Current AML outbound rule resources in Terraform state:"
+                      terraform state list | grep 'managed_network_outbound_' || true
 
                       echo "------------------------------------------------------------"
                       echo "Running final drift check plan..."
+
                       set +e
                       terraform plan -no-color -var-file="terraform.tfvars" -detailed-exitcode
-                      plan_exit=$?
+                      PLAN_EXIT=$?
                       set -e
 
-                      if [ "$plan_exit" -eq 0 ]; then
+                      if [ "$PLAN_EXIT" -eq 0 ]; then
                         echo "SUCCESS: Terraform plan is clean. No changes detected."
-                      elif [ "$plan_exit" -eq 2 ]; then
-                        echo "ERROR: Terraform still sees changes after import. Review the plan output. Do not apply blindly."
+                      elif [ "$PLAN_EXIT" -eq 2 ]; then
+                        echo "ERROR: Terraform still sees changes after state move/import."
+                        echo "Do not apply blindly. Review the plan output."
                         exit 2
                       else
                         echo "ERROR: terraform plan failed."
-                        exit "$plan_exit"
+                        exit "$PLAN_EXIT"
                       fi
