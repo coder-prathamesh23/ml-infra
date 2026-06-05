@@ -43,12 +43,16 @@ variables:
   - name: ML_ENGINEERS_GROUP_OBJECT_ID
     value: 28073c52-9c1f-48e3-bda5-93dfda257f91
 
+  - name: TF_IN_AUTOMATION
+    value: "true"
+
 pool:
   name: azumanage-flz
 
 stages:
   - stage: GenerateConfig
     displayName: Generate starter config
+    dependsOn: []
     condition: eq('${{ parameters.action }}', 'generate-config')
     jobs:
       - job: GenerateConfig
@@ -193,6 +197,7 @@ stages:
 
   - stage: ImportPlan
     displayName: Import plan
+    dependsOn: []
     condition: or(eq('${{ parameters.action }}', 'import-plan'), eq('${{ parameters.action }}', 'import-apply'))
     jobs:
       - job: ImportPlan
@@ -307,9 +312,10 @@ stages:
             artifact: tfplan
             displayName: Publish import plan artifact
 
-    - stage: ImportApply
+  - stage: ImportApply
     displayName: Import apply
-    dependsOn: ImportPlan
+    dependsOn:
+      - ImportPlan
     condition: and(succeeded('ImportPlan'), eq('${{ parameters.action }}', 'import-apply'))
     jobs:
       - deployment: ImportApply
@@ -348,19 +354,32 @@ stages:
                       STACK_PATH="${STACK_PATH#/}"
                       STACK_PATH="${STACK_PATH%/}"
 
+                      if [ ! -d "$STACK_PATH" ]; then
+                        echo "ERROR: Stack path does not exist: $STACK_PATH"
+                        exit 1
+                      fi
+
                       cd "$STACK_PATH"
+
+                      if [ ! -f "$(Pipeline.Workspace)/tfplan/tfplan" ]; then
+                        echo "ERROR: Saved tfplan artifact not found at $(Pipeline.Workspace)/tfplan/tfplan"
+                        echo "Contents of tfplan artifact directory:"
+                        ls -la "$(Pipeline.Workspace)/tfplan" || true
+                        exit 1
+                      fi
 
                       if [ -f "$(Pipeline.Workspace)/tfplan/zz_generated_rbac_imports.tf" ]; then
                         cp "$(Pipeline.Workspace)/tfplan/zz_generated_rbac_imports.tf" ./zz_generated_rbac_imports.tf
                       else
                         echo "ERROR: zz_generated_rbac_imports.tf not found in tfplan artifact."
+                        echo "Contents of tfplan artifact directory:"
+                        ls -la "$(Pipeline.Workspace)/tfplan" || true
                         exit 1
                       fi
 
-                      if [ ! -f "$(Pipeline.Workspace)/tfplan/tfplan" ]; then
-                        echo "ERROR: Saved tfplan not found in tfplan artifact."
-                        exit 1
-                      fi
+                      : "${TF_BACKEND_RG:?TF_BACKEND_RG is required}"
+                      : "${TF_BACKEND_STORAGE:?TF_BACKEND_STORAGE is required}"
+                      : "${TF_BACKEND_CONTAINER:?TF_BACKEND_CONTAINER is required}"
 
                       KEY="${DEPLOY_ENV}/${STACK_PATH}/terraform.tfstate"
 
@@ -372,3 +391,58 @@ stages:
                         -backend-config="use_azuread_auth=true"
 
                       terraform apply -no-color -auto-approve "$(Pipeline.Workspace)/tfplan/tfplan"
+
+  - stage: NormalPlan
+    displayName: Normal plan after reconciliation
+    dependsOn: []
+    condition: eq('${{ parameters.action }}', 'normal-plan')
+    jobs:
+      - job: NormalPlan
+        displayName: Normal Terraform plan
+        steps:
+          - checkout: self
+
+          - task: TerraformInstaller@1
+            displayName: Install Terraform
+            inputs:
+              terraformVersion: ${{ parameters.terraformVersion }}
+
+          - task: AzureCLI@2
+            displayName: Terraform normal plan
+            inputs:
+              azureSubscription: "$(AZURE_SERVICE_CONNECTION)"
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+
+                az account set --subscription "$(TARGET_SUBSCRIPTION_ID)"
+
+                STACK_PATH="${{ parameters.stackPath }}"
+                STACK_PATH="${STACK_PATH#/}"
+                STACK_PATH="${STACK_PATH%/}"
+
+                if [ ! -d "$STACK_PATH" ]; then
+                  echo "ERROR: Stack path does not exist: $STACK_PATH"
+                  exit 1
+                fi
+
+                cd "$STACK_PATH"
+
+                : "${TF_BACKEND_RG:?TF_BACKEND_RG is required}"
+                : "${TF_BACKEND_STORAGE:?TF_BACKEND_STORAGE is required}"
+                : "${TF_BACKEND_CONTAINER:?TF_BACKEND_CONTAINER is required}"
+
+                KEY="${DEPLOY_ENV}/${STACK_PATH}/terraform.tfstate"
+
+                terraform init -input=false -no-color \
+                  -backend-config="resource_group_name=${TF_BACKEND_RG}" \
+                  -backend-config="storage_account_name=${TF_BACKEND_STORAGE}" \
+                  -backend-config="container_name=${TF_BACKEND_CONTAINER}" \
+                  -backend-config="key=${KEY}" \
+                  -backend-config="use_azuread_auth=true"
+
+                terraform fmt -check -diff -recursive
+                terraform validate -no-color
+                terraform plan -no-color -var-file="terraform.tfvars"
