@@ -307,14 +307,16 @@ stages:
             artifact: tfplan
             displayName: Publish import plan artifact
 
-  - stage: ImportApply
+    - stage: ImportApply
     displayName: Import apply
     dependsOn: ImportPlan
-    condition: and(succeeded(), eq('${{ parameters.action }}', 'import-apply'))
+    condition: and(succeeded('ImportPlan'), eq('${{ parameters.action }}', 'import-apply'))
     jobs:
       - deployment: ImportApply
         displayName: Apply import plan
         environment: ${{ variables.AZDO_ENVIRONMENT }}
+        pool:
+          name: azumanage-flz
         strategy:
           runOnce:
             deploy:
@@ -350,6 +352,14 @@ stages:
 
                       if [ -f "$(Pipeline.Workspace)/tfplan/zz_generated_rbac_imports.tf" ]; then
                         cp "$(Pipeline.Workspace)/tfplan/zz_generated_rbac_imports.tf" ./zz_generated_rbac_imports.tf
+                      else
+                        echo "ERROR: zz_generated_rbac_imports.tf not found in tfplan artifact."
+                        exit 1
+                      fi
+
+                      if [ ! -f "$(Pipeline.Workspace)/tfplan/tfplan" ]; then
+                        echo "ERROR: Saved tfplan not found in tfplan artifact."
+                        exit 1
                       fi
 
                       KEY="${DEPLOY_ENV}/${STACK_PATH}/terraform.tfstate"
@@ -362,48 +372,3 @@ stages:
                         -backend-config="use_azuread_auth=true"
 
                       terraform apply -no-color -auto-approve "$(Pipeline.Workspace)/tfplan/tfplan"
-
-  - stage: NormalPlan
-    displayName: Normal plan after reconciliation
-    condition: eq('${{ parameters.action }}', 'normal-plan')
-    jobs:
-      - job: NormalPlan
-        displayName: Normal Terraform plan
-        steps:
-          - checkout: self
-
-          - task: TerraformInstaller@1
-            displayName: Install Terraform
-            inputs:
-              terraformVersion: ${{ parameters.terraformVersion }}
-
-          - task: AzureCLI@2
-            displayName: Terraform normal plan
-            inputs:
-              azureSubscription: "$(AZURE_SERVICE_CONNECTION)"
-              scriptType: bash
-              scriptLocation: inlineScript
-              addSpnToEnvironment: true
-              inlineScript: |
-                set -euo pipefail
-
-                az account set --subscription "$(TARGET_SUBSCRIPTION_ID)"
-
-                STACK_PATH="${{ parameters.stackPath }}"
-                STACK_PATH="${STACK_PATH#/}"
-                STACK_PATH="${STACK_PATH%/}"
-
-                cd "$STACK_PATH"
-
-                KEY="${DEPLOY_ENV}/${STACK_PATH}/terraform.tfstate"
-
-                terraform init -input=false -no-color \
-                  -backend-config="resource_group_name=${TF_BACKEND_RG}" \
-                  -backend-config="storage_account_name=${TF_BACKEND_STORAGE}" \
-                  -backend-config="container_name=${TF_BACKEND_CONTAINER}" \
-                  -backend-config="key=${KEY}" \
-                  -backend-config="use_azuread_auth=true"
-
-                terraform fmt -check -diff -recursive
-                terraform validate -no-color
-                terraform plan -no-color -var-file="terraform.tfvars"
