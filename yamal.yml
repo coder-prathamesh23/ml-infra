@@ -23,13 +23,13 @@ parameters:
     default: 1.13.3
 
 variables:
-  - group: DATA_SCIENCE_CENTRAL_REGISTRY
+  - group: DATA_SCIENCE_CENTRAL_LZ
 
   - name: DEPLOY_ENV
     value: central
 
   - name: AZDO_ENVIRONMENT
-    value: data-science-central-rbac-reconcile
+    value: data-science-central-registry
 
   - name: TARGET_SUBSCRIPTION_ID
     value: 5e31240a-3ca1-4c5b-b0f0-57cc61cec9b4
@@ -79,21 +79,19 @@ stages:
 
                 get_assignment_ids() {
                   local assignee="$1"
-                  local principal_type="$2"
-                  local role="$3"
-                  local scope="$4"
+                  local role="$2"
+                  local scope="$3"
 
                   az role assignment list \
-                    --assignee-object-id "$assignee" \
-                    --assignee-principal-type "$principal_type" \
+                    --assignee "$assignee" \
                     --role "$role" \
                     --scope "$scope" \
                     --query "[].id" \
                     -o tsv | sed '/^$/d' || true
                 }
 
-                mapfile -t REGISTRY_ASSIGNMENT_IDS < <(get_assignment_ids "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" "ServicePrincipal" "$(NETWORK_APPROVER_ROLE_NAME)" "$(CENTRAL_REGISTRY_ID)")
-                mapfile -t FOUNDRY_ASSIGNMENT_IDS < <(get_assignment_ids "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" "ServicePrincipal" "$(NETWORK_APPROVER_ROLE_NAME)" "$(CENTRAL_FOUNDRY_ID)")
+                mapfile -t REGISTRY_ASSIGNMENT_IDS < <(get_assignment_ids "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" "$(NETWORK_APPROVER_ROLE_NAME)" "$(CENTRAL_REGISTRY_ID)")
+                mapfile -t FOUNDRY_ASSIGNMENT_IDS < <(get_assignment_ids "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" "$(NETWORK_APPROVER_ROLE_NAME)" "$(CENTRAL_FOUNDRY_ID)")
 
                 REGISTRY_ASSIGNMENT_ID="${REGISTRY_ASSIGNMENT_IDS[0]:-NOT_FOUND}"
                 FOUNDRY_ASSIGNMENT_ID="${FOUNDRY_ASSIGNMENT_IDS[0]:-NOT_FOUND}"
@@ -184,8 +182,7 @@ stages:
                 echo ""
                 echo "Existing assignments on central AML Registry for Dev AML workspace managed identity:"
                 az role assignment list \
-                  --assignee-object-id "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" \
-                  --assignee-principal-type ServicePrincipal \
+                  --assignee "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" \
                   --scope "$(CENTRAL_REGISTRY_ID)" \
                   --query "[].{role:roleDefinitionName,scope:scope,id:id}" \
                   -o table || true
@@ -193,8 +190,7 @@ stages:
                 echo ""
                 echo "Existing assignments on central Foundry resource for Dev AML workspace managed identity:"
                 az role assignment list \
-                  --assignee-object-id "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" \
-                  --assignee-principal-type ServicePrincipal \
+                  --assignee "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" \
                   --scope "$(CENTRAL_FOUNDRY_ID)" \
                   --query "[].{role:roleDefinitionName,scope:scope,id:id}" \
                   -o table || true
@@ -259,14 +255,12 @@ stages:
 
                 require_one_assignment_id() {
                   local assignee="$1"
-                  local principal_type="$2"
-                  local role="$3"
-                  local scope="$4"
-                  local label="$5"
+                  local role="$2"
+                  local scope="$3"
+                  local label="$4"
 
                   mapfile -t ids < <(az role assignment list \
-                    --assignee-object-id "$assignee" \
-                    --assignee-principal-type "$principal_type" \
+                    --assignee "$assignee" \
                     --role "$role" \
                     --scope "$scope" \
                     --query "[].id" \
@@ -279,15 +273,14 @@ stages:
                     echo "Scope: $scope" >&2
                     echo "Role: $role" >&2
                     echo "Assignee object ID: $assignee" >&2
-                    echo "Principal type: $principal_type" >&2
                     exit 1
                   fi
 
                   echo "${ids[0]}"
                 }
 
-                REGISTRY_ASSIGNMENT_ID="$(require_one_assignment_id "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" "ServicePrincipal" "$(NETWORK_APPROVER_ROLE_NAME)" "$(CENTRAL_REGISTRY_ID)" "Dev AML MI Network Connection Approver on central AML Registry")"
-                FOUNDRY_ASSIGNMENT_ID="$(require_one_assignment_id "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" "ServicePrincipal" "$(NETWORK_APPROVER_ROLE_NAME)" "$(CENTRAL_FOUNDRY_ID)" "Dev AML MI Network Connection Approver on central Foundry resource")"
+                REGISTRY_ASSIGNMENT_ID="$(require_one_assignment_id "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" "$(NETWORK_APPROVER_ROLE_NAME)" "$(CENTRAL_REGISTRY_ID)" "Dev AML MI Network Connection Approver on central AML Registry")"
+                FOUNDRY_ASSIGNMENT_ID="$(require_one_assignment_id "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" "$(NETWORK_APPROVER_ROLE_NAME)" "$(CENTRAL_FOUNDRY_ID)" "Dev AML MI Network Connection Approver on central Foundry resource")"
 
                 : > zz_generated_rbac_imports.tf
 
