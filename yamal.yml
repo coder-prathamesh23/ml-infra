@@ -15,7 +15,7 @@ parameters:
   - name: stackPath
     displayName: Terraform stack path
     type: string
-    default: stacks/addons/environment-rbac
+    default: stacks/addons/central-registry-rbac
 
   - name: terraformVersion
     displayName: Terraform version
@@ -23,25 +23,28 @@ parameters:
     default: 1.13.3
 
 variables:
-  - group: DATA_SCIENCE_LZ_DEV
+  - group: DATA_SCIENCE_CENTRAL_REGISTRY
 
   - name: DEPLOY_ENV
-    value: dev
+    value: central
 
   - name: AZDO_ENVIRONMENT
-    value: data-science-lz-dev-rbac-reconcile
+    value: data-science-central-rbac-reconcile
 
   - name: TARGET_SUBSCRIPTION_ID
-    value: f956ebe7-509b-41be-8dc2-6310517151c1
+    value: 5e31240a-3ca1-4c5b-b0f0-57cc61cec9b4
 
-  - name: DEV_AML_WORKSPACE_ID
-    value: /subscriptions/f956ebe7-509b-41be-8dc2-6310517151c1/resourceGroups/rg-core-dev-dslz-westus3/providers/Microsoft.MachineLearningServices/workspaces/mlw-dev-dslz-westus3
+  - name: CENTRAL_REGISTRY_ID
+    value: /subscriptions/5e31240a-3ca1-4c5b-b0f0-57cc61cec9b4/resourceGroups/rg-core-central-dslz-westus3/providers/Microsoft.MachineLearningServices/registries/central-ml-registry
 
-  - name: DEV_AML_STORAGE_ACCOUNT_ID
-    value: /subscriptions/f956ebe7-509b-41be-8dc2-6310517151c1/resourceGroups/rg-core-dev-dslz-westus3/providers/Microsoft.Storage/storageAccounts/stdslzdevwestus301
+  - name: CENTRAL_FOUNDRY_ID
+    value: /subscriptions/5e31240a-3ca1-4c5b-b0f0-57cc61cec9b4/resourceGroups/rg-core-central-dslz-westus3/providers/Microsoft.CognitiveServices/accounts/aif-central-dslz-westus3
 
-  - name: ML_ENGINEERS_GROUP_OBJECT_ID
-    value: 28073c52-9c1f-48e3-bda5-93dfda257f91
+  - name: DEV_AML_WORKSPACE_MI_OBJECT_ID
+    value: 4dcb1e4d-8272-441b-a62b-fcffaf588a7c
+
+  - name: NETWORK_APPROVER_ROLE_NAME
+    value: Azure AI Enterprise Network Connection Approver
 
   - name: TF_IN_AUTOMATION
     value: "true"
@@ -56,12 +59,12 @@ stages:
     condition: eq('${{ parameters.action }}', 'generate-config')
     jobs:
       - job: GenerateConfig
-        displayName: Discover existing Dev environment RBAC
+        displayName: Discover existing central RBAC
         steps:
           - checkout: self
 
           - task: AzureCLI@2
-            displayName: Discover existing role assignments and generate outputs
+            displayName: Discover existing central role assignments and generate outputs
             inputs:
               azureSubscription: "$(AZURE_SERVICE_CONNECTION)"
               scriptType: bash
@@ -76,124 +79,129 @@ stages:
 
                 get_assignment_ids() {
                   local assignee="$1"
-                  local role="$2"
-                  local scope="$3"
+                  local principal_type="$2"
+                  local role="$3"
+                  local scope="$4"
 
                   az role assignment list \
-                    --assignee "$assignee" \
+                    --assignee-object-id "$assignee" \
+                    --assignee-principal-type "$principal_type" \
                     --role "$role" \
                     --scope "$scope" \
                     --query "[].id" \
                     -o tsv | sed '/^$/d' || true
                 }
 
-                mapfile -t AML_ASSIGNMENT_IDS < <(get_assignment_ids "$(ML_ENGINEERS_GROUP_OBJECT_ID)" "Contributor" "$(DEV_AML_WORKSPACE_ID)")
-                mapfile -t STORAGE_ASSIGNMENT_IDS < <(get_assignment_ids "$(ML_ENGINEERS_GROUP_OBJECT_ID)" "Storage Blob Data Contributor" "$(DEV_AML_STORAGE_ACCOUNT_ID)")
+                mapfile -t REGISTRY_ASSIGNMENT_IDS < <(get_assignment_ids "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" "ServicePrincipal" "$(NETWORK_APPROVER_ROLE_NAME)" "$(CENTRAL_REGISTRY_ID)")
+                mapfile -t FOUNDRY_ASSIGNMENT_IDS < <(get_assignment_ids "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" "ServicePrincipal" "$(NETWORK_APPROVER_ROLE_NAME)" "$(CENTRAL_FOUNDRY_ID)")
 
-                AML_ASSIGNMENT_ID="${AML_ASSIGNMENT_IDS[0]:-NOT_FOUND}"
-                STORAGE_ASSIGNMENT_ID="${STORAGE_ASSIGNMENT_IDS[0]:-NOT_FOUND}"
+                REGISTRY_ASSIGNMENT_ID="${REGISTRY_ASSIGNMENT_IDS[0]:-NOT_FOUND}"
+                FOUNDRY_ASSIGNMENT_ID="${FOUNDRY_ASSIGNMENT_IDS[0]:-NOT_FOUND}"
 
-                cat > "$(Build.ArtifactStagingDirectory)/generated/dev-environment-rbac-discovery.txt" <<EOF
-                Dev Environment RBAC Reconciliation Discovery
+                cat > "$(Build.ArtifactStagingDirectory)/generated/dev-central-rbac-discovery.txt" <<EOF
+                Dev Central RBAC Reconciliation Discovery
 
-                1. ML_engineers access on Dev AML workspace
+                1. Dev AML workspace managed identity access on central AML Registry
                 Scope:
-                $(DEV_AML_WORKSPACE_ID)
+                $(CENTRAL_REGISTRY_ID)
 
                 Principal:
-                ML_engineers AD group
+                Dev AML workspace managed identity
 
                 Principal object ID:
-                $(ML_ENGINEERS_GROUP_OBJECT_ID)
+                $(DEV_AML_WORKSPACE_MI_OBJECT_ID)
 
                 Expected role:
-                Contributor
+                $(NETWORK_APPROVER_ROLE_NAME)
 
                 Matching assignment count:
-                ${#AML_ASSIGNMENT_IDS[@]}
+                ${#REGISTRY_ASSIGNMENT_IDS[@]}
 
                 Existing Azure role assignment full resource ID:
-                ${AML_ASSIGNMENT_ID}
+                ${REGISTRY_ASSIGNMENT_ID}
 
 
-                2. ML_engineers access on Dev AML workspace storage account
+                2. Dev AML workspace managed identity access on central Foundry resource
                 Scope:
-                $(DEV_AML_STORAGE_ACCOUNT_ID)
+                $(CENTRAL_FOUNDRY_ID)
 
                 Principal:
-                ML_engineers AD group
+                Dev AML workspace managed identity
 
                 Principal object ID:
-                $(ML_ENGINEERS_GROUP_OBJECT_ID)
+                $(DEV_AML_WORKSPACE_MI_OBJECT_ID)
 
                 Expected role:
-                Storage Blob Data Contributor
+                $(NETWORK_APPROVER_ROLE_NAME)
 
                 Matching assignment count:
-                ${#STORAGE_ASSIGNMENT_IDS[@]}
+                ${#FOUNDRY_ASSIGNMENT_IDS[@]}
 
                 Existing Azure role assignment full resource ID:
-                ${STORAGE_ASSIGNMENT_ID}
+                ${FOUNDRY_ASSIGNMENT_ID}
                 EOF
 
-                cat > "$(Build.ArtifactStagingDirectory)/generated/dev-environment-rbac-starter-tfvars-snippet.hcl" <<EOF
+                cat > "$(Build.ArtifactStagingDirectory)/generated/dev-central-rbac-starter-tfvars-snippet.hcl" <<EOF
                 # Starter snippet only.
                 # Do not paste blindly.
-                # Merge these entries into existing stacks/addons/environment-rbac/terraform.tfvars maps.
+                # Use only after matching Terraform variables/resources are added to the central RBAC module.
 
-                # Add inside existing aml_workspace_role_assignments map:
-                ml_engineers = {
-                  principal_id                     = "$(ML_ENGINEERS_GROUP_OBJECT_ID)"
-                  principal_type                   = "Group"
-                  role_definition_name             = "Contributor"
-                  skip_service_principal_aad_check = false
+                registry_network_connection_approver_role_assignments = {
+                  dev_aml_workspace_identity = {
+                    principal_id                     = "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)"
+                    principal_type                   = "ServicePrincipal"
+                    skip_service_principal_aad_check = true
+                  }
                 }
 
-                # Add inside existing storage_blob_role_assignments map:
-                ml_engineers = {
-                  principal_id                     = "$(ML_ENGINEERS_GROUP_OBJECT_ID)"
-                  principal_type                   = "Group"
-                  skip_service_principal_aad_check = false
+                foundry_network_connection_approver_role_assignments = {
+                  dev_aml_workspace_identity = {
+                    principal_id                     = "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)"
+                    principal_type                   = "ServicePrincipal"
+                    skip_service_principal_aad_check = true
+                  }
                 }
                 EOF
 
-                cat > "$(Build.ArtifactStagingDirectory)/generated/dev-environment-rbac-imports.tf" <<EOF
+                cat > "$(Build.ArtifactStagingDirectory)/generated/dev-central-rbac-imports.tf" <<EOF
                 # Starter import blocks only.
-                # Use after matching Terraform config has been added.
+                # Use only after matching Terraform resources have been added.
 
                 import {
-                  to = module.environment_rbac.azurerm_role_assignment.aml_workspace_access["ml_engineers"]
-                  id = "${AML_ASSIGNMENT_ID}"
+                  to = module.central_registry_rbac.azurerm_role_assignment.registry_network_connection_approver["dev_aml_workspace_identity"]
+                  id = "${REGISTRY_ASSIGNMENT_ID}"
                 }
 
                 import {
-                  to = module.environment_rbac.azurerm_role_assignment.storage_blob_data_contributor["ml_engineers"]
-                  id = "${STORAGE_ASSIGNMENT_ID}"
+                  to = module.central_registry_rbac.azurerm_role_assignment.foundry_network_connection_approver["dev_aml_workspace_identity"]
+                  id = "${FOUNDRY_ASSIGNMENT_ID}"
                 }
                 EOF
 
                 echo "Generated discovery:"
-                cat "$(Build.ArtifactStagingDirectory)/generated/dev-environment-rbac-discovery.txt"
+                cat "$(Build.ArtifactStagingDirectory)/generated/dev-central-rbac-discovery.txt"
 
                 echo ""
-                echo "Existing assignments on AML workspace for this group:"
+                echo "Existing assignments on central AML Registry for Dev AML workspace managed identity:"
                 az role assignment list \
-                  --assignee "$(ML_ENGINEERS_GROUP_OBJECT_ID)" \
-                  --scope "$(DEV_AML_WORKSPACE_ID)" \
+                  --assignee-object-id "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" \
+                  --assignee-principal-type ServicePrincipal \
+                  --scope "$(CENTRAL_REGISTRY_ID)" \
                   --query "[].{role:roleDefinitionName,scope:scope,id:id}" \
                   -o table || true
 
                 echo ""
-                echo "Existing assignments on storage account for this group:"
+                echo "Existing assignments on central Foundry resource for Dev AML workspace managed identity:"
                 az role assignment list \
-                  --assignee "$(ML_ENGINEERS_GROUP_OBJECT_ID)" \
-                  --scope "$(DEV_AML_STORAGE_ACCOUNT_ID)" \
+                  --assignee-object-id "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" \
+                  --assignee-principal-type ServicePrincipal \
+                  --scope "$(CENTRAL_FOUNDRY_ID)" \
                   --query "[].{role:roleDefinitionName,scope:scope,id:id}" \
                   -o table || true
 
           - publish: "$(Build.ArtifactStagingDirectory)/generated"
             artifact: generated-rbac-config
-            displayName: Publish generated RBAC config
+            displayName: Publish generated central RBAC config
 
   - stage: ImportPlan
     displayName: Import plan
@@ -251,12 +259,14 @@ stages:
 
                 require_one_assignment_id() {
                   local assignee="$1"
-                  local role="$2"
-                  local scope="$3"
-                  local label="$4"
+                  local principal_type="$2"
+                  local role="$3"
+                  local scope="$4"
+                  local label="$5"
 
                   mapfile -t ids < <(az role assignment list \
-                    --assignee "$assignee" \
+                    --assignee-object-id "$assignee" \
+                    --assignee-principal-type "$principal_type" \
                     --role "$role" \
                     --scope "$scope" \
                     --query "[].id" \
@@ -268,33 +278,34 @@ stages:
                     echo "ERROR: Expected exactly one existing role assignment for $label, found ${#ids[@]}." >&2
                     echo "Scope: $scope" >&2
                     echo "Role: $role" >&2
-                    echo "Assignee: $assignee" >&2
+                    echo "Assignee object ID: $assignee" >&2
+                    echo "Principal type: $principal_type" >&2
                     exit 1
                   fi
 
                   echo "${ids[0]}"
                 }
 
-                AML_ASSIGNMENT_ID="$(require_one_assignment_id "$(ML_ENGINEERS_GROUP_OBJECT_ID)" "Contributor" "$(DEV_AML_WORKSPACE_ID)" "ML_engineers Contributor on Dev AML workspace")"
-                STORAGE_ASSIGNMENT_ID="$(require_one_assignment_id "$(ML_ENGINEERS_GROUP_OBJECT_ID)" "Storage Blob Data Contributor" "$(DEV_AML_STORAGE_ACCOUNT_ID)" "ML_engineers Storage Blob Data Contributor on Dev storage")"
+                REGISTRY_ASSIGNMENT_ID="$(require_one_assignment_id "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" "ServicePrincipal" "$(NETWORK_APPROVER_ROLE_NAME)" "$(CENTRAL_REGISTRY_ID)" "Dev AML MI Network Connection Approver on central AML Registry")"
+                FOUNDRY_ASSIGNMENT_ID="$(require_one_assignment_id "$(DEV_AML_WORKSPACE_MI_OBJECT_ID)" "ServicePrincipal" "$(NETWORK_APPROVER_ROLE_NAME)" "$(CENTRAL_FOUNDRY_ID)" "Dev AML MI Network Connection Approver on central Foundry resource")"
 
                 : > zz_generated_rbac_imports.tf
 
-                if ! terraform state show 'module.environment_rbac.azurerm_role_assignment.aml_workspace_access["ml_engineers"]' >/dev/null 2>&1; then
+                if ! terraform state show 'module.central_registry_rbac.azurerm_role_assignment.registry_network_connection_approver["dev_aml_workspace_identity"]' >/dev/null 2>&1; then
                   cat >> zz_generated_rbac_imports.tf <<EOF
                 import {
-                  to = module.environment_rbac.azurerm_role_assignment.aml_workspace_access["ml_engineers"]
-                  id = "$AML_ASSIGNMENT_ID"
+                  to = module.central_registry_rbac.azurerm_role_assignment.registry_network_connection_approver["dev_aml_workspace_identity"]
+                  id = "$REGISTRY_ASSIGNMENT_ID"
                 }
 
                 EOF
                 fi
 
-                if ! terraform state show 'module.environment_rbac.azurerm_role_assignment.storage_blob_data_contributor["ml_engineers"]' >/dev/null 2>&1; then
+                if ! terraform state show 'module.central_registry_rbac.azurerm_role_assignment.foundry_network_connection_approver["dev_aml_workspace_identity"]' >/dev/null 2>&1; then
                   cat >> zz_generated_rbac_imports.tf <<EOF
                 import {
-                  to = module.environment_rbac.azurerm_role_assignment.storage_blob_data_contributor["ml_engineers"]
-                  id = "$STORAGE_ASSIGNMENT_ID"
+                  to = module.central_registry_rbac.azurerm_role_assignment.foundry_network_connection_approver["dev_aml_workspace_identity"]
+                  id = "$FOUNDRY_ASSIGNMENT_ID"
                 }
 
                 EOF
